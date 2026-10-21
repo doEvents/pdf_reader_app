@@ -8,11 +8,11 @@ import 'package:file_picker/file_picker.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
+import 'package:share_plus/share_plus.dart';
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Tangkap path file jika aplikasi dibuka lewat klik 2x file PDF di OS
   String? initialPath;
   if (args.isNotEmpty) {
     final possiblePath = args.first;
@@ -44,7 +44,7 @@ class _MyAppState extends State<MyApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'PDF Reader & Signer',
+      title: 'Fajar PDF Reader',
       debugShowCheckedModeBanner: false,
       themeMode: _themeMode,
       theme: ThemeData(
@@ -79,7 +79,7 @@ class PlacedSignature {
   double relY;
   double relWidth;
   double relHeight;
-  double rotation; // Sudut rotasi dalam radian
+  double rotation;
 
   PlacedSignature({
     required this.id,
@@ -120,12 +120,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   final List<PlacedSignature> _placedSignatures = [];
   List<File> _savedSignatureFiles = [];
   String? _selectedSigId;
-
-  // Menyimpan bytes tanda tangan yang sedang dipilih untuk ditaruh di halaman
   Uint8List? _activeSignatureBytes;
 
   int _currentPage = 1;
   int _totalPages = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedSignatures();
+    _loadRecentFiles();
+
+    if (widget.initialFilepath != null && widget.initialFilepath!.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _openPdfFromPath(widget.initialFilepath!);
+      });
+    }
+  }
 
   void _goToPage(int page) {
     if (_pdfController.isReady && _totalPages > 0) {
@@ -174,20 +185,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     );
   }
 
-  @override
-  void initState() {
-    super.initState();
-    _loadSavedSignatures();
-    _loadRecentFiles();
-
-    // Jika aplikasi dibuka dengan mengklik file PDF di OS (Windows/Mac/Android)
-    if (widget.initialFilepath != null && widget.initialFilepath!.isNotEmpty) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _openPdfFromPath(widget.initialFilepath!);
-      });
-    }
-  }
-
   Future<File> _getRecentHistoryFile() async {
     final appDir = await getApplicationDocumentsDirectory();
     return File('${appDir.path}${Platform.pathSeparator}pdf_recent_history.json');
@@ -213,11 +210,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             }
           }
         }
-        if (mounted) {
-          setState(() {
-            _recentFiles = loaded;
-          });
-        }
+        if (mounted) setState(() => _recentFiles = loaded);
       }
     } catch (_) {}
   }
@@ -230,14 +223,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           '${now.day.toString().padLeft(2, '0')}/${now.month.toString().padLeft(2, '0')}/${now.year} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
       _recentFiles.removeWhere((item) => item['path'] == path);
-      _recentFiles.insert(0, {
-        'path': path,
-        'name': name,
-        'time': timeStr,
-      });
-      if (_recentFiles.length > 20) {
-        _recentFiles = _recentFiles.sublist(0, 20);
-      }
+      _recentFiles.insert(0, {'path': path, 'name': name, 'time': timeStr});
+      if (_recentFiles.length > 20) _recentFiles = _recentFiles.sublist(0, 20);
       if (mounted) setState(() {});
 
       final file = await _getRecentHistoryFile();
@@ -266,7 +253,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   void _openPdfFromPath(String path) {
     final file = File(path);
     if (!file.existsSync()) {
-      _showAndroidToast('File tidak ditemukan atau sudah dipindahkan.');
+      _showToast('File tidak ditemukan atau sudah dipindahkan.');
       _removeRecentFile(path);
       return;
     }
@@ -282,6 +269,47 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _totalPages = 0;
     });
     _addToRecentFiles(path, name);
+  }
+
+  /// Fungsi Bagikan File (Android, Windows, macOS) via share_plus
+  Future<void> _shareCurrentPdf() async {
+    if (_filePath == null) return;
+    try {
+      final xFile = XFile(_filePath!);
+      await Share.shareXFiles([xFile], text: 'Dokumen PDF: $_fileName');
+    } catch (e) {
+      _showToast('Gagal membagikan file: $e');
+    }
+  }
+
+  /// Cek konfirmasi jika ada perubahan/tanda tangan belum disimpan saat keluar/tutup
+  Future<bool> _onWillPop() async {
+    if (_filePath == null || _placedSignatures.isEmpty) {
+      return true; // Boleh keluar langsung
+    }
+
+    final bool? shouldClose = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Perubahan Belum Disimpan'),
+        content: const Text(
+          'Anda memiliki tanda tangan atau editan yang belum disimpan ke file PDF. Yakin ingin keluar/menutup dokumen ini?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Batal'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Keluar Tanpa Simpan'),
+          ),
+        ],
+      ),
+    );
+
+    return shouldClose ?? false;
   }
 
   void _openHistoryModal() {
@@ -402,9 +430,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   Future<Directory> _getSignatureDir() async {
     final appDir = await getApplicationDocumentsDirectory();
     final sigDir = Directory('${appDir.path}/pdf_reader_signatures');
-    if (!await sigDir.exists()) {
-      await sigDir.create(recursive: true);
-    }
+    if (!await sigDir.exists()) await sigDir.create(recursive: true);
     return sigDir;
   }
 
@@ -416,15 +442,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         .where((f) => f.path.toLowerCase().endsWith('.png'))
         .toList();
     files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-    setState(() {
-      _savedSignatureFiles = files;
-    });
+    setState(() => _savedSignatureFiles = files);
   }
 
   Future<void> _saveSignatureToBank(Uint8List bytes) async {
     final dir = await _getSignatureDir();
-    final file = File(
-        '${dir.path}/sig_${DateTime.now().millisecondsSinceEpoch}.png');
+    final file = File('${dir.path}/sig_${DateTime.now().millisecondsSinceEpoch}.png');
     await file.writeAsBytes(bytes);
     await _loadSavedSignatures();
   }
@@ -443,9 +466,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         allowedExtensions: ['pdf'],
       );
 
-      if (result != null &&
-          result.isNotEmpty &&
-          result.single.path != null) {
+      if (result != null && result.isNotEmpty && result.single.path != null) {
+        if (_filePath != null && _placedSignatures.isNotEmpty) {
+          bool canProceed = await _onWillPop();
+          if (!canProceed) return;
+        }
         _openPdfFromPath(result.single.path!);
       }
     } catch (e) {
@@ -453,7 +478,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
-  /// Helper untuk memperkecil resolusi gambar (tanda tangan)
   Future<Uint8List> _resizeImageBytes(Uint8List inputBytes, double scale) async {
     try {
       final codec = await ui.instantiateImageCodec(inputBytes);
@@ -464,10 +488,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final targetH = (uiImage.height * scale).toInt().clamp(20, uiImage.height);
 
       final recorder = ui.PictureRecorder();
-      final canvas = Canvas(
-        recorder,
-        Rect.fromLTWH(0, 0, targetW.toDouble(), targetH.toDouble()),
-      );
+      final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, targetW.toDouble(), targetH.toDouble()));
       canvas.drawImageRect(
         uiImage,
         Rect.fromLTWH(0, 0, uiImage.width.toDouble(), uiImage.height.toDouble()),
@@ -480,19 +501,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       uiImage.dispose();
       resizedImage.dispose();
 
-      if (byteData != null) {
-        return byteData.buffer.asUint8List();
-      }
+      if (byteData != null) return byteData.buffer.asUint8List();
     } catch (_) {}
     return inputBytes;
   }
 
-  void _showAndroidToast(
-    String message, {
-    String? actionLabel,
-    VoidCallback? onAction,
-    int durationSeconds = 3,
-  }) {
+  void _showToast(String message, {String? actionLabel, VoidCallback? onAction}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).clearSnackBars();
     ScaffoldMessenger.of(context).showSnackBar(
@@ -500,21 +514,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         elevation: 0,
         backgroundColor: Colors.transparent,
         behavior: SnackBarBehavior.floating,
-        duration: Duration(seconds: durationSeconds),
+        duration: const Duration(seconds: 3),
         margin: const EdgeInsets.only(bottom: 28, left: 24, right: 24),
         content: Center(
           child: Container(
             constraints: const BoxConstraints(maxWidth: 520),
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
             decoration: BoxDecoration(
-              color: const Color(0xE6323232), // Abu-abu gelap khas toast Android
+              color: const Color(0xE6323232),
               borderRadius: BorderRadius.circular(50),
               boxShadow: const [
-                BoxShadow(
-                  color: Colors.black26,
-                  blurRadius: 8,
-                  offset: Offset(0, 3),
-                ),
+                BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 3)),
               ],
             ),
             child: Row(
@@ -559,14 +569,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   Future<void> _exportSignedPdf({required bool saveAs}) async {
     if (_filePath == null) return;
 
-    // 1. Hitung ukuran file asli
     final originalFile = File(_filePath!);
     final originalBytes = await originalFile.readAsBytes();
     final originalSizeKb = originalBytes.length / 1024;
 
-    // 2. Tampilkan Dialog Pilihan Ukuran & Kompresi Keseluruhan
     bool useOriginalSize = true;
-    double scaleFactor = 0.6; // Default kompresi 60%
+    double scaleFactor = 0.6;
 
     if (!mounted) return;
     final bool? confirmSave = await showDialog<bool>(
@@ -602,8 +610,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     ),
                     RadioListTile<bool>(
                       title: const Text('Perkecil Keseluruhan File PDF'),
-                      subtitle: const Text(
-                          'Kompres resolusi seluruh halaman dokumen & tanda tangan'),
+                      subtitle: const Text('Kompres resolusi seluruh halaman dokumen & tanda tangan'),
                       value: false,
                       groupValue: useOriginalSize,
                       onChanged: (val) => setStateModal(() => useOriginalSize = val!),
@@ -617,8 +624,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         max: 0.9,
                         divisions: 6,
                         label: '${(scaleFactor * 100).toInt()}%',
-                        onChanged: (val) =>
-                            setStateModal(() => scaleFactor = val.clamp(0.3, 0.9)),
+                        onChanged: (val) => setStateModal(() => scaleFactor = val.clamp(0.3, 0.9)),
                       ),
                     ],
                     const Divider(height: 24),
@@ -663,7 +669,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
     if (confirmSave != true || !mounted) return;
 
-    // Tampilkan loading dialog selama proses render & kompresi PDF
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -682,7 +687,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       Uint8List signedBytes;
 
       if (useOriginalSize) {
-        // --- PROSES UKURAN ASLI ---
         final pdfDoc = sf.PdfDocument(inputBytes: originalBytes);
         pdfDoc.fileStructure.incrementalUpdate = false;
 
@@ -710,23 +714,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         signedBytes = Uint8List.fromList(await pdfDoc.save());
         pdfDoc.dispose();
       } else {
-        // --- PROSES PERKECIL KESELURUHAN DOKUMEN PDF ---
-        // Menggunakan pdfrx untuk merender setiap halaman sesuai skala kompresi
-        // dan menyusun ulang PDF agar ukuran file benar-benar turun drastis.
         final sourceDoc = await PdfDocument.openFile(_filePath!);
         final newPdfDoc = sf.PdfDocument();
         newPdfDoc.compressionLevel = sf.PdfCompressionLevel.best;
         newPdfDoc.pageSettings.margins.all = 0;
 
-        // Skala render piksel halaman:
-        // Base 1.5x (setara ~108 DPI standar baca) dikali scaleFactor pilihan user
         final renderScale = 1.5 * scaleFactor;
 
         for (int i = 0; i < sourceDoc.pages.length; i++) {
           final srcPage = sourceDoc.pages[i];
           final pageNum = i + 1;
 
-          // Buat halaman baru dengan ukuran poin yang sama persis dengan halaman asli
           final section = newPdfDoc.sections!.add();
           section.pageSettings.margins.all = 0;
           section.pageSettings.size = Size(srcPage.width, srcPage.height);
@@ -737,7 +735,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           final dstPage = section.pages.add();
           final pageSize = dstPage.getClientSize();
 
-          // Render halaman PDF asli ke bitmap dengan resolusi yang diperkecil
           final targetWidth = (srcPage.width * renderScale).toInt().clamp(100, 4000);
           final targetHeight = (srcPage.height * renderScale).toInt().clamp(100, 4000);
 
@@ -763,7 +760,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             }
           }
 
-          // Tempelkan tanda tangan yang ada pada halaman ini
           final sigsOnPage = _placedSignatures.where((s) => s.pageNumber == pageNum);
           for (final sig in sigsOnPage) {
             dstPage.graphics.save();
@@ -787,11 +783,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         newPdfDoc.dispose();
       }
 
-      // Tutup dialog loading
       if (mounted) Navigator.pop(context);
 
       String? targetSavePath;
-
       if (saveAs) {
         final Uri? saveUri = await FilePicker.saveFile(
           dialogTitle: 'Simpan PDF Sebagai (Save As)',
@@ -802,16 +796,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         );
 
         if (saveUri != null) {
-          targetSavePath = saveUri.scheme == 'file'
-              ? saveUri.toFilePath()
-              : saveUri.toString();
-
+          targetSavePath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
           if (!targetSavePath.toLowerCase().endsWith('.pdf')) {
             targetSavePath = '$targetSavePath.pdf';
           }
         }
       } else {
-        // Mode Save: langsung gunakan path file asli yang dibuka
         targetSavePath = _originalFilePath ?? _filePath;
       }
 
@@ -820,10 +810,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final int lastPage = _currentPage;
 
         if (!saveAs) {
-          // Lepas lock file di Windows sejenak agar tidak error saat ditimpa
-          setState(() {
-            _filePath = null;
-          });
+          setState(() => _filePath = null);
           await Future.delayed(const Duration(milliseconds: 150));
         }
 
@@ -836,21 +823,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
             : '${savedSizeKb.toStringAsFixed(0)} KB';
 
         if (!saveAs && mounted) {
-          // Buka kembali file yang sudah ditimpa dan bersihkan layer tanda tangan
           setState(() {
             _filePath = finalPath;
             _placedSignatures.clear();
             _selectedSigId = null;
           });
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            Future.delayed(const Duration(milliseconds: 200), () {
-              _goToPage(lastPage);
-            });
+            Future.delayed(const Duration(milliseconds: 200), () => _goToPage(lastPage));
           });
         }
 
         if (mounted) {
-          _showAndroidToast(
+          _showToast(
             saveAs
                 ? 'Berhasil disimpan ($savedSizeText): ${finalPath.split(Platform.pathSeparator).last}'
                 : 'File berhasil diperbarui ($savedSizeText)',
@@ -869,10 +853,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         }
       }
     } catch (e) {
-      if (mounted && Navigator.canPop(context)) {
-        Navigator.pop(context);
-      }
-      _showAndroidToast('Gagal menyimpan PDF: $e');
+      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+      _showToast('Gagal menyimpan PDF: $e');
     }
   }
 
@@ -935,11 +917,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                               type: FileType.custom,
                               allowedExtensions: ['png'],
                             );
-                            if (res != null &&
-                                res.isNotEmpty &&
-                                res.single.path != null) {
-                              final bytes =
-                                  await File(res.single.path!).readAsBytes();
+                            if (res != null && res.isNotEmpty && res.single.path != null) {
+                              final bytes = await File(res.single.path!).readAsBytes();
                               await _saveSignatureToBank(bytes);
                               setModalState(() {});
                             }
@@ -962,15 +941,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         width: double.infinity,
                         padding: const EdgeInsets.symmetric(vertical: 36),
                         decoration: BoxDecoration(
-                          border: Border.all(
-                            color: Theme.of(context).colorScheme.outlineVariant,
-                          ),
+                          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: const Column(
                           children: [
-                            Icon(Icons.inbox_outlined,
-                                size: 40, color: Colors.grey),
+                            Icon(Icons.inbox_outlined, size: 40, color: Colors.grey),
                             SizedBox(height: 8),
                             Text('Belum ada tanda tangan tersimpan'),
                           ],
@@ -982,8 +958,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         child: ListView.separated(
                           scrollDirection: Axis.horizontal,
                           itemCount: _savedSignatureFiles.length,
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 12),
+                          separatorBuilder: (_, __) => const SizedBox(width: 12),
                           itemBuilder: (context, index) {
                             final file = _savedSignatureFiles[index];
                             final bytes = file.readAsBytesSync();
@@ -991,10 +966,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                               borderRadius: BorderRadius.circular(12),
                               onTap: () {
                                 Navigator.pop(ctx);
-                                setState(() {
-                                  _activeSignatureBytes = bytes;
-                                });
-                                _showAndroidToast('Mode Tempel Aktif: Klik pada halaman PDF untuk meletakkan tanda tangan.');
+                                setState(() => _activeSignatureBytes = bytes);
+                                _showToast('Mode Tempel Aktif: Klik pada halaman PDF untuk meletakkan tanda tangan.');
                               },
                               child: Container(
                                 width: 170,
@@ -1002,9 +975,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                   color: Colors.grey.shade100,
                                   borderRadius: BorderRadius.circular(12),
                                   border: Border.all(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .outlineVariant,
+                                    color: Theme.of(context).colorScheme.outlineVariant,
                                   ),
                                 ),
                                 child: Stack(
@@ -1012,10 +983,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                     Center(
                                       child: Padding(
                                         padding: const EdgeInsets.all(12.0),
-                                        child: Image.memory(
-                                          bytes,
-                                          fit: BoxFit.contain,
-                                        ),
+                                        child: Image.memory(bytes, fit: BoxFit.contain),
                                       ),
                                     ),
                                     Positioned(
@@ -1049,33 +1017,22 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     );
   }
 
-  /// Dekompresi ZIP murni di Dart (100% Offline untuk Android & Windows tanpa package tambahan)
   String? _extractDocxXmlPureDart(Uint8List bytes) {
     try {
       int i = 0;
       while (i < bytes.length - 30) {
-        // Cari signature Local File Header ZIP: 0x04034b50
-        if (bytes[i] == 0x50 &&
-            bytes[i + 1] == 0x4b &&
-            bytes[i + 2] == 0x03 &&
-            bytes[i + 3] == 0x04) {
+        if (bytes[i] == 0x50 && bytes[i + 1] == 0x4b && bytes[i + 2] == 0x03 && bytes[i + 3] == 0x04) {
           final compression = bytes[i + 8] | (bytes[i + 9] << 8);
-          final compSize = bytes[i + 18] |
-              (bytes[i + 19] << 8) |
-              (bytes[i + 20] << 16) |
-              (bytes[i + 21] << 24);
+          final compSize = bytes[i + 18] | (bytes[i + 19] << 8) | (bytes[i + 20] << 16) | (bytes[i + 21] << 24);
           final nameLen = bytes[i + 26] | (bytes[i + 27] << 8);
           final extraLen = bytes[i + 28] | (bytes[i + 29] << 8);
           final nameStart = i + 30;
           if (nameStart + nameLen > bytes.length) break;
 
-          final fileName =
-              utf8.decode(bytes.sublist(nameStart, nameStart + nameLen), allowMalformed: true);
+          final fileName = utf8.decode(bytes.sublist(nameStart, nameStart + nameLen), allowMalformed: true);
           final dataStart = nameStart + nameLen + extraLen;
 
-          if (fileName == 'word/document.xml' &&
-              compSize > 0 &&
-              dataStart + compSize <= bytes.length) {
+          if (fileName == 'word/document.xml' && compSize > 0 && dataStart + compSize <= bytes.length) {
             final compData = bytes.sublist(dataStart, dataStart + compSize);
             List<int> decompressed;
             if (compression == 0) {
@@ -1094,7 +1051,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     return null;
   }
 
-  /// Ekstrak teks dari file .docx (ZIP XML) atau .doc secara Offline di Android & Windows
   Future<String> _extractTextFromWord(String path) async {
     try {
       final bytes = await File(path).readAsBytes();
@@ -1115,22 +1071,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         }
       }
       final raw = utf8.decode(bytes, allowMalformed: true);
-      final clean = raw
-          .replaceAll(RegExp(r'[^\x20-\x7E\n\r\t]'), ' ')
-          .replaceAll(RegExp(r' {3,}'), '\n');
-      return clean.trim().isEmpty
-          ? 'Dokumen Word (${path.split(Platform.pathSeparator).last})'
-          : clean.trim();
+      final clean = raw.replaceAll(RegExp(r'[^\x20-\x7E\n\r\t]'), ' ').replaceAll(RegExp(r' {3,}'), '\n');
+      return clean.trim().isEmpty ? 'Dokumen Word' : clean.trim();
     } catch (e) {
-      return 'Gagal mengekstrak teks dokumen: $e';
+      return 'Gagal mengekstrak teks: $e';
     }
   }
 
-  /// Konversi DOCX/DOC ke PDF via MS Word (Windows) jika tersedia di sistem
   Future<Uint8List?> _tryConvertWordToPdfWindows(String inputPath) async {
     if (!Platform.isWindows) return null;
-    final outPath =
-        '${Directory.systemTemp.path}\\word_conv_${DateTime.now().millisecondsSinceEpoch}.pdf';
+    final outPath = '${Directory.systemTemp.path}\\word_conv_${DateTime.now().millisecondsSinceEpoch}.pdf';
     try {
       final escapedIn = inputPath.replaceAll("'", "''");
       final escapedOut = outPath.replaceAll("'", "''");
@@ -1143,10 +1093,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 \$doc.Close(\$false)
 \$word.Quit()
 ''';
-      final res = await Process.run(
-        'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command', script],
-      ).timeout(const Duration(seconds: 25));
+      final res = await Process.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script])
+          .timeout(const Duration(seconds: 25));
 
       if (res.exitCode == 0 && await File(outPath).exists()) {
         final bytes = await File(outPath).readAsBytes();
@@ -1157,15 +1105,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     return null;
   }
 
-  /// Modal & Proses Tambah / Insert Halaman (PDF, Gambar, DOCX/DOC)
   Future<void> _openInsertPageModal() async {
     if (_filePath == null || _totalPages <= 0) return;
 
-    // Pilihan posisi: 0 = Awal, 1 = Setelah Halaman Tertentu (Default: halaman saat ini), 2 = Akhir
     int insertPosOption = 1;
     final afterPageCtrl = TextEditingController(text: _currentPage.toString());
 
-    // 1. Tampilkan Modal Pengaturan Posisi Insert Terlebih Dahulu
     final bool? proceedToPick = await showDialog<bool>(
       context: context,
       builder: (ctx) {
@@ -1186,41 +1131,31 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        'Pilih posisi penyisipan halaman baru:',
-                        style: TextStyle(fontWeight: FontWeight.w600),
-                      ),
+                      const Text('Pilih posisi penyisipan halaman baru:', style: TextStyle(fontWeight: FontWeight.w600)),
                       const SizedBox(height: 8),
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
                         title: const Text('Di Awal Dokumen'),
-                        subtitle: const Text('Menjadi halaman ke-1'),
                         value: 0,
                         groupValue: insertPosOption,
-                        onChanged: (val) =>
-                            setModalState(() => insertPosOption = val!),
+                        onChanged: (val) => setModalState(() => insertPosOption = val!),
                       ),
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
                         title: const Text('Di Antara / Setelah Halaman'),
-                        subtitle: Text(
-                            'Default: setelah halaman saat ini (Hal $_currentPage)'),
                         value: 1,
                         groupValue: insertPosOption,
-                        onChanged: (val) =>
-                            setModalState(() => insertPosOption = val!),
+                        onChanged: (val) => setModalState(() => insertPosOption = val!),
                       ),
                       if (insertPosOption == 1)
                         Padding(
-                          padding: const EdgeInsets.only(
-                              left: 36, right: 8, bottom: 8, top: 4),
+                          padding: const EdgeInsets.only(left: 36, right: 8, bottom: 8, top: 4),
                           child: TextField(
                             controller: afterPageCtrl,
                             keyboardType: TextInputType.number,
                             decoration: InputDecoration(
                               isDense: true,
-                              labelText:
-                                  'Sisipkan setelah nomor halaman (1 - $_totalPages)',
+                              labelText: 'Sisipkan setelah nomor halaman (1 - $_totalPages)',
                               border: const OutlineInputBorder(),
                             ),
                           ),
@@ -1228,35 +1163,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
                         title: const Text('Di Akhir Dokumen'),
-                        subtitle:
-                            Text('Setelah halaman terakhir (Hal $_totalPages)'),
                         value: 2,
                         groupValue: insertPosOption,
-                        onChanged: (val) =>
-                            setModalState(() => insertPosOption = val!),
-                      ),
-                      const Divider(height: 24),
-                      Container(
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context)
-                              .colorScheme
-                              .surfaceContainerHighest,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: const Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Icon(Icons.attach_file, size: 18),
-                            SizedBox(width: 8),
-                            Expanded(
-                              child: Text(
-                                'Format didukung: File PDF lain (.pdf), Gambar (.png, .jpg, .jpeg, .webp), atau Dokumen Word (.docx, .doc).',
-                                style: TextStyle(fontSize: 12.5),
-                              ),
-                            ),
-                          ],
-                        ),
+                        onChanged: (val) => setModalState(() => insertPosOption = val!),
                       ),
                     ],
                   ),
@@ -1283,26 +1192,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
     int insertAfterPage = _currentPage;
     if (insertPosOption == 0) {
-      insertAfterPage = 0; // Sebelum halaman 1
+      insertAfterPage = 0;
     } else if (insertPosOption == 1) {
-      insertAfterPage =
-          (int.tryParse(afterPageCtrl.text) ?? _currentPage).clamp(0, _totalPages);
+      insertAfterPage = (int.tryParse(afterPageCtrl.text) ?? _currentPage).clamp(0, _totalPages);
     } else {
-      insertAfterPage = _totalPages; // Di akhir dokumen
+      insertAfterPage = _totalPages;
     }
 
-    // 2. Pilih File yang Akan Disisipkan
     final pickResult = await FilePicker.pickFiles(
-      dialogTitle: 'Pilih File PDF, Gambar, atau Word (DOCX/DOC)',
+      dialogTitle: 'Pilih File PDF, Gambar, atau Word',
       type: FileType.custom,
       allowedExtensions: ['pdf', 'png', 'jpg', 'jpeg', 'webp', 'docx', 'doc'],
     );
 
-    if (pickResult == null ||
-        pickResult.isEmpty ||
-        pickResult.single.path == null) {
-      return;
-    }
+    if (pickResult == null || pickResult.isEmpty || pickResult.single.path == null) return;
 
     final pickedPath = pickResult.single.path!;
     final ext = pickedPath.split('.').last.toLowerCase();
@@ -1323,7 +1226,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     );
 
     try {
-      // Siapkan sumber halaman yang akan di-insert sebagai PdfDocument sementara
       Uint8List? insertPdfBytes;
 
       if (ext == 'pdf') {
@@ -1332,17 +1234,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         final imgBytes = await File(pickedPath).readAsBytes();
         final tempDoc = sf.PdfDocument();
         tempDoc.pageSettings.margins.all = 0;
-
         final bitmap = sf.PdfBitmap(imgBytes);
-        // Sesuaikan orientasi halaman A4 dengan orientasi gambar
         tempDoc.pageSettings.orientation = bitmap.width > bitmap.height
             ? sf.PdfPageOrientation.landscape
             : sf.PdfPageOrientation.portrait;
 
         final page = tempDoc.pages.add();
         final pageSize = page.getClientSize();
-
-        // Hitung skala proporsional (fit center) di halaman
         final imgAspect = bitmap.width / bitmap.height;
         final pageAspect = pageSize.width / pageSize.height;
         double drawW = pageSize.width;
@@ -1352,37 +1250,19 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         } else {
           drawW = drawH * imgAspect;
         }
-        final offsetX = (pageSize.width - drawW) / 2;
-        final offsetY = (pageSize.height - drawH) / 2;
-
-        page.graphics.drawImage(
-          bitmap,
-          Rect.fromLTWH(offsetX, offsetY, drawW, drawH),
-        );
-
+        page.graphics.drawImage(bitmap, Rect.fromLTWH((pageSize.width - drawW) / 2, (pageSize.height - drawH) / 2, drawW, drawH));
         insertPdfBytes = Uint8List.fromList(await tempDoc.save());
         tempDoc.dispose();
       } else if (ext == 'docx' || ext == 'doc') {
-        // Coba konversi presisi via MS Word jika tersedia di Windows, jika tidak gunakan ekstraksi teks
         insertPdfBytes = await _tryConvertWordToPdfWindows(pickedPath);
         if (insertPdfBytes == null) {
           final extractedText = await _extractTextFromWord(pickedPath);
           final tempDoc = sf.PdfDocument();
           final page = tempDoc.pages.add();
           final font = sf.PdfStandardFont(sf.PdfFontFamily.helvetica, 11);
-          final textElement = sf.PdfTextElement(
-            text: extractedText,
-            font: font,
-            brush: sf.PdfBrushes.black,
-          );
-          textElement.draw(
+          sf.PdfTextElement(text: extractedText, font: font, brush: sf.PdfBrushes.black).draw(
             page: page,
-            bounds: Rect.fromLTWH(
-              0,
-              0,
-              page.getClientSize().width,
-              page.getClientSize().height,
-            ),
+            bounds: Rect.fromLTWH(0, 0, page.getClientSize().width, page.getClientSize().height),
             format: sf.PdfLayoutFormat(layoutType: sf.PdfLayoutType.paginate),
           );
           insertPdfBytes = Uint8List.fromList(await tempDoc.save());
@@ -1390,12 +1270,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         }
       }
 
-      if (insertPdfBytes == null) {
-        throw Exception('Format file tidak dapat diproses.');
-      }
+      if (insertPdfBytes == null) throw Exception('Format file tidak dapat diproses.');
 
-      // Gabungkan dokumen asli dengan dokumen sisipan menggunakan template halaman
-      // (Menjaga kualitas vektor & teks asli 100%)
       final originalBytes = await File(_filePath!).readAsBytes();
       final baseDoc = sf.PdfDocument(inputBytes: originalBytes);
       final insDoc = sf.PdfDocument(inputBytes: insertPdfBytes);
@@ -1405,7 +1281,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       void copyPageToOut(sf.PdfPage srcPage) {
         final section = outDoc.sections!.add();
         section.pageSettings.margins.all = 0;
-        // Gunakan ukuran asli halaman
         final rawSize = srcPage.size;
         section.pageSettings.orientation = rawSize.width > rawSize.height
             ? sf.PdfPageOrientation.landscape
@@ -1415,25 +1290,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           rawSize.width > rawSize.height ? rawSize.width : rawSize.height,
         );
         final newPage = section.pages.add();
-        final template = srcPage.createTemplate();
-        newPage.graphics.drawPdfTemplate(template, Offset.zero);
+        newPage.graphics.drawPdfTemplate(srcPage.createTemplate(), Offset.zero);
       }
 
       final int baseCount = baseDoc.pages.count;
       final int addedCount = insDoc.pages.count;
 
       if (insertAfterPage <= 0) {
-        for (int j = 0; j < addedCount; j++) {
-          copyPageToOut(insDoc.pages[j]);
-        }
+        for (int j = 0; j < addedCount; j++) copyPageToOut(insDoc.pages[j]);
       }
 
       for (int i = 0; i < baseCount; i++) {
         copyPageToOut(baseDoc.pages[i]);
         if (i + 1 == insertAfterPage) {
-          for (int j = 0; j < addedCount; j++) {
-            copyPageToOut(insDoc.pages[j]);
-          }
+          for (int j = 0; j < addedCount; j++) copyPageToOut(insDoc.pages[j]);
         }
       }
 
@@ -1442,44 +1312,27 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       insDoc.dispose();
       outDoc.dispose();
 
-      // Geser nomor halaman tanda tangan yang berada setelah titik sisipan
       for (final sig in _placedSignatures) {
-        if (sig.pageNumber > insertAfterPage) {
-          sig.pageNumber += addedCount;
-        }
+        if (sig.pageNumber > insertAfterPage) sig.pageNumber += addedCount;
       }
 
-      // Simpan hasil penggabungan ke file sementara kerja & muat ulang viewer
-      final tempWorkFile = File(
-          '${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}_${_fileName ?? "doc.pdf"}');
+      final tempWorkFile = File('${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}.pdf');
       await tempWorkFile.writeAsBytes(mergedBytes, flush: true);
 
-      if (mounted) Navigator.pop(context); // Tutup dialog loading
+      if (mounted) Navigator.pop(context);
 
-      final int targetViewPage =
-          (insertAfterPage + 1).clamp(1, baseCount + addedCount);
-
-      setState(() {
-        _filePath = tempWorkFile.path;
-      });
-
+      setState(() => _filePath = tempWorkFile.path);
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        Future.delayed(const Duration(milliseconds: 250), () {
-          _goToPage(targetViewPage);
-        });
+        Future.delayed(const Duration(milliseconds: 250), () => _goToPage(insertAfterPage + 1));
       });
 
-      _showAndroidToast(
-          'Berhasil menyisipkan $addedCount halaman (Jangan lupa klik Save untuk menyimpan permanen)');
+      _showToast('Berhasil menyisipkan $addedCount halaman');
     } catch (e) {
-      if (mounted && Navigator.canPop(context)) {
-        Navigator.pop(context);
-      }
-      _showAndroidToast('Gagal menyisipkan halaman: $e');
+      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+      _showToast('Gagal menyisipkan halaman: $e');
     }
   }
 
-  /// Helper menyalin halaman antar dokumen Syncfusion dengan mempertahankan ukuran & orientasi
   void _copyPageToDoc(sf.PdfDocument outDoc, sf.PdfPage srcPage) {
     final section = outDoc.sections!.add();
     section.pageSettings.margins.all = 0;
@@ -1493,30 +1346,20 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     );
     section.pageSettings.rotate = srcPage.rotation;
     final newPage = section.pages.add();
-    final template = srcPage.createTemplate();
-    newPage.graphics.drawPdfTemplate(template, Offset.zero);
+    newPage.graphics.drawPdfTemplate(srcPage.createTemplate(), Offset.zero);
   }
 
-  /// Simpan byte hasil edit halaman ke file kerja sementara dan refresh PDF Viewer
   Future<void> _applyModifiedPdfBytes(Uint8List bytes, int targetPage, String toastMsg) async {
-    final tempWorkFile = File(
-        '${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}_${_fileName ?? "doc.pdf"}');
+    final tempWorkFile = File('${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}.pdf');
     await tempWorkFile.writeAsBytes(bytes, flush: true);
 
-    setState(() {
-      _filePath = tempWorkFile.path;
-    });
-
+    setState(() => _filePath = tempWorkFile.path);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      Future.delayed(const Duration(milliseconds: 250), () {
-        _goToPage(targetPage);
-      });
+      Future.delayed(const Duration(milliseconds: 250), () => _goToPage(targetPage));
     });
-
-    _showAndroidToast(toastMsg);
+    _showToast(toastMsg);
   }
 
-  /// 1. Rotasi Halaman Saat Ini (atau Semua Halaman)
   Future<void> _rotatePdfPages({required bool clockwise, bool allPages = false}) async {
     if (_filePath == null) return;
     try {
@@ -1545,19 +1388,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
       final saved = Uint8List.fromList(await doc.save());
       doc.dispose();
-      await _applyModifiedPdfBytes(
-        saved,
-        _currentPage,
-        allPages
-            ? 'Semua halaman berhasil diputar'
-            : 'Halaman $_currentPage berhasil diputar',
-      );
+      await _applyModifiedPdfBytes(saved, _currentPage, allPages ? 'Semua halaman diputar' : 'Halaman diputar');
     } catch (e) {
-      _showAndroidToast('Gagal memutar halaman: $e');
+      _showToast('Gagal memutar halaman: $e');
     }
   }
 
-  /// 2. Tambah Halaman Kosong (Blank Page) setelah halaman saat ini
   Future<void> _insertBlankPage() async {
     if (_filePath == null) return;
     try {
@@ -1585,25 +1421,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       }
 
       for (final sig in _placedSignatures) {
-        if (sig.pageNumber > _currentPage) {
-          sig.pageNumber += 1;
-        }
+        if (sig.pageNumber > _currentPage) sig.pageNumber += 1;
       }
 
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(
-        saved,
-        _currentPage + 1,
-        'Halaman kosong ditambahkan di Hal ${_currentPage + 1}',
-      );
+      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Halaman kosong ditambahkan');
     } catch (e) {
-      _showAndroidToast('Gagal menambah halaman kosong: $e');
+      _showToast('Gagal menambah halaman: $e');
     }
   }
 
-  /// 3. Duplikat Halaman Saat Ini
   Future<void> _duplicateCurrentPage() async {
     if (_filePath == null) return;
     try {
@@ -1615,35 +1444,26 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final int targetIdx = _currentPage - 1;
       for (int i = 0; i < baseDoc.pages.count; i++) {
         _copyPageToDoc(outDoc, baseDoc.pages[i]);
-        if (i == targetIdx) {
-          _copyPageToDoc(outDoc, baseDoc.pages[i]);
-        }
+        if (i == targetIdx) _copyPageToDoc(outDoc, baseDoc.pages[i]);
       }
 
       for (final sig in _placedSignatures) {
-        if (sig.pageNumber > _currentPage) {
-          sig.pageNumber += 1;
-        }
+        if (sig.pageNumber > _currentPage) sig.pageNumber += 1;
       }
 
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(
-        saved,
-        _currentPage + 1,
-        'Halaman $_currentPage berhasil diduplikat',
-      );
+      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Halaman diduplikat');
     } catch (e) {
-      _showAndroidToast('Gagal menduplikat halaman: $e');
+      _showToast('Gagal menduplikat: $e');
     }
   }
 
-  /// 4. Hapus Halaman Saat Ini
   Future<void> _deleteCurrentPage() async {
     if (_filePath == null) return;
     if (_totalPages <= 1) {
-      _showAndroidToast('Tidak bisa menghapus satu-satunya halaman di dokumen ini.');
+      _showToast('Tidak bisa menghapus satu-satunya halaman.');
       return;
     }
 
@@ -1651,12 +1471,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Hapus Halaman'),
-        content: Text('Yakin ingin menghapus Halaman $_currentPage dari dokumen?'),
+        content: Text('Yakin ingin menghapus Halaman $_currentPage?'),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Batal'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () => Navigator.pop(ctx, true),
@@ -1676,38 +1493,25 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
       final int removeIdx = _currentPage - 1;
       for (int i = 0; i < baseDoc.pages.count; i++) {
-        if (i != removeIdx) {
-          _copyPageToDoc(outDoc, baseDoc.pages[i]);
-        }
+        if (i != removeIdx) _copyPageToDoc(outDoc, baseDoc.pages[i]);
       }
 
       _placedSignatures.removeWhere((s) => s.pageNumber == _currentPage);
       for (final sig in _placedSignatures) {
-        if (sig.pageNumber > _currentPage) {
-          sig.pageNumber -= 1;
-        }
+        if (sig.pageNumber > _currentPage) sig.pageNumber -= 1;
       }
 
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      final newTarget = _currentPage > 1 ? _currentPage - 1 : 1;
-      await _applyModifiedPdfBytes(
-        saved,
-        newTarget,
-        'Halaman $_currentPage berhasil dihapus',
-      );
+      await _applyModifiedPdfBytes(saved, _currentPage > 1 ? _currentPage - 1 : 1, 'Halaman dihapus');
     } catch (e) {
-      _showAndroidToast('Gagal menghapus halaman: $e');
+      _showToast('Gagal menghapus: $e');
     }
   }
 
-  /// 5. Pindahkan Halaman Saat Ini ke Nomor Urutan Lain
   Future<void> _moveCurrentPageDialog() async {
-    if (_filePath == null || _totalPages <= 1) {
-      _showAndroidToast('Dokumen hanya memiliki 1 halaman.');
-      return;
-    }
+    if (_filePath == null || _totalPages <= 1) return;
 
     final targetCtrl = TextEditingController(text: _currentPage.toString());
     final int? targetPage = await showDialog<int>(
@@ -1718,23 +1522,11 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           controller: targetCtrl,
           keyboardType: TextInputType.number,
           autofocus: true,
-          decoration: InputDecoration(
-            labelText: 'Pindahkan ke urutan halaman (1 - $_totalPages)',
-            border: const OutlineInputBorder(),
-          ),
+          decoration: const InputDecoration(labelText: 'Pindah ke urutan halaman', border: OutlineInputBorder()),
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal'),
-          ),
-          FilledButton(
-            onPressed: () {
-              final val = int.tryParse(targetCtrl.text);
-              Navigator.pop(ctx, val);
-            },
-            child: const Text('Pindahkan'),
-          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, int.tryParse(targetCtrl.text)), child: const Text('Pindahkan')),
         ],
       ),
     );
@@ -1753,33 +1545,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final int movedIdx = order.removeAt(_currentPage - 1);
       order.insert(newPos - 1, movedIdx);
 
-      for (final idx in order) {
-        _copyPageToDoc(outDoc, baseDoc.pages[idx]);
-      }
+      for (final idx in order) _copyPageToDoc(outDoc, baseDoc.pages[idx]);
 
-      // Sesuaikan nomor halaman tanda tangan
       for (final sig in _placedSignatures) {
         final oldIdx = sig.pageNumber - 1;
         final updatedPos = order.indexOf(oldIdx);
-        if (updatedPos != -1) {
-          sig.pageNumber = updatedPos + 1;
-        }
+        if (updatedPos != -1) sig.pageNumber = updatedPos + 1;
       }
 
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(
-        saved,
-        newPos,
-        'Halaman $_currentPage dipindahkan ke halaman $newPos',
-      );
+      await _applyModifiedPdfBytes(saved, newPos, 'Halaman dipindahkan');
     } catch (e) {
-      _showAndroidToast('Gagal memindahkan halaman: $e');
+      _showToast('Gagal memindahkan: $e');
     }
   }
 
-  /// 6. Ekstrak Halaman Saat Ini Menjadi File PDF Baru
   Future<void> _extractCurrentPageToPdf() async {
     if (_filePath == null) return;
     try {
@@ -1794,7 +1576,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       outDoc.dispose();
 
       final Uri? saveUri = await FilePicker.saveFile(
-        dialogTitle: 'Ekstrak Halaman $_currentPage Sebagai PDF Baru',
+        dialogTitle: 'Ekstrak Halaman Sebagai PDF',
         fileName: 'Hal_${_currentPage}_${_fileName ?? "document.pdf"}',
         type: FileType.custom,
         allowedExtensions: ['pdf'],
@@ -1802,30 +1584,23 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       );
 
       if (saveUri != null) {
-        String savePath = saveUri.scheme == 'file'
-            ? saveUri.toFilePath()
-            : saveUri.toString();
-        if (!savePath.toLowerCase().endsWith('.pdf')) {
-          savePath = '$savePath.pdf';
-        }
+        String savePath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
+        if (!savePath.toLowerCase().endsWith('.pdf')) savePath = '$savePath.pdf';
         await File(savePath).writeAsBytes(extractedBytes, flush: true);
-        _showAndroidToast('Halaman $_currentPage berhasil diekstrak!');
+        _showToast('Halaman berhasil diekstrak!');
       }
     } catch (e) {
-      _showAndroidToast('Gagal mengekstrak halaman: $e');
+      _showToast('Gagal mengekstrak: $e');
     }
   }
 
-  /// Menu Modal Pusat "Kelola Halaman" (Responsif untuk Android & Windows)
   void _openPageManagerModal() {
     if (_filePath == null || _totalPages <= 0) return;
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
       builder: (ctx) {
         return SafeArea(
           child: Padding(
@@ -1841,113 +1616,43 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
-                          'Kelola Halaman (Aktif: Hal $_currentPage dari $_totalPages)',
-                          style: Theme.of(context)
-                              .textTheme
-                              .titleMedium
-                              ?.copyWith(fontWeight: FontWeight.bold),
+                          'Kelola Halaman (Hal $_currentPage dari $_totalPages)',
+                          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
                         ),
                       ),
-                      IconButton(
-                        onPressed: () => Navigator.pop(ctx),
-                        icon: const Icon(Icons.close),
-                      ),
+                      IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close)),
                     ],
                   ),
                   const Divider(),
                   ListTile(
                     leading: const Icon(Icons.post_add_outlined, color: Colors.indigo),
                     title: const Text('Sisipkan File (PDF / Gambar / Word)'),
-                    subtitle: const Text('Tambah di awal, tengah, atau akhir dokumen'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _openInsertPageModal();
-                    },
+                    onTap: () { Navigator.pop(ctx); _openInsertPageModal(); },
                   ),
                   ListTile(
                     leading: const Icon(Icons.note_add_outlined, color: Colors.teal),
-                    title: const Text('Tambah Halaman Kosong (Blank Page)'),
-                    subtitle: Text('Sisipkan kertas kosong setelah Hal $_currentPage'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _insertBlankPage();
-                    },
+                    title: const Text('Tambah Halaman Kosong'),
+                    onTap: () { Navigator.pop(ctx); _insertBlankPage(); },
                   ),
                   ListTile(
                     leading: const Icon(Icons.copy_all_outlined, color: Colors.blue),
-                    title: Text('Duplikat Halaman $_currentPage'),
-                    subtitle: const Text('Gandakan halaman yang sedang dibuka'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _duplicateCurrentPage();
-                    },
+                    title: const Text('Duplikat Halaman Ini'),
+                    onTap: () { Navigator.pop(ctx); _duplicateCurrentPage(); },
                   ),
                   ListTile(
                     leading: const Icon(Icons.low_priority_outlined, color: Colors.orange),
-                    title: Text('Pindahkan Urutan Halaman $_currentPage...'),
-                    subtitle: const Text('Ubah posisi nomor halaman ke urutan lain'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _moveCurrentPageDialog();
-                    },
+                    title: const Text('Pindahkan Urutan Halaman...'),
+                    onTap: () { Navigator.pop(ctx); _moveCurrentPageDialog(); },
                   ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
-                    child: Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        OutlinedButton.icon(
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            _rotatePdfPages(clockwise: false, allPages: false);
-                          },
-                          icon: const Icon(Icons.rotate_left, size: 18),
-                          label: const Text('Putar Kiri 90°'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            _rotatePdfPages(clockwise: true, allPages: false);
-                          },
-                          icon: const Icon(Icons.rotate_right, size: 18),
-                          label: const Text('Putar Kanan 90°'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: () {
-                            Navigator.pop(ctx);
-                            _rotatePdfPages(clockwise: true, allPages: true);
-                          },
-                          icon: const Icon(Icons.sync, size: 18),
-                          label: const Text('Putar Semua'),
-                        ),
-                      ],
-                    ),
-                  ),
-                  const Divider(),
                   ListTile(
                     leading: const Icon(Icons.ios_share_outlined, color: Colors.deepPurple),
-                    title: Text('Ekstrak Halaman $_currentPage ke PDF Baru'),
-                    subtitle: const Text('Simpan halaman ini saja sebagai file terpisah'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _extractCurrentPageToPdf();
-                    },
+                    title: const Text('Ekstrak Halaman ke PDF Baru'),
+                    onTap: () { Navigator.pop(ctx); _extractCurrentPageToPdf(); },
                   ),
                   ListTile(
                     leading: const Icon(Icons.delete_forever_outlined, color: Colors.redAccent),
-                    title: Text(
-                      'Hapus Halaman $_currentPage',
-                      style: const TextStyle(
-                        color: Colors.redAccent,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    subtitle: const Text('Hapus halaman aktif dari dokumen PDF'),
-                    onTap: () {
-                      Navigator.pop(ctx);
-                      _deleteCurrentPage();
-                    },
+                    title: const Text('Hapus Halaman Ini', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600)),
+                    onTap: () { Navigator.pop(ctx); _deleteCurrentPage(); },
                   ),
                 ],
               ),
@@ -1960,750 +1665,369 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(
-          _fileName ?? 'PDF Reader',
-          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18),
-        ),
-        centerTitle: false,
-        actions: [
-          IconButton(
-            tooltip: 'Buka File PDF',
-            icon: const Icon(Icons.folder_open_outlined),
-            onPressed: _pickPdfFile,
-          ),
-          IconButton(
-            tooltip: 'Riwayat File Dibuka',
-            icon: const Icon(Icons.history),
-            onPressed: _openHistoryModal,
-          ),
-          if (_filePath != null) ...[
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        final bool shouldPop = await _onWillPop();
+        if (shouldPop && context.mounted) {
+          Navigator.of(context).pop();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(_fileName ?? 'Fajar PDF Reader', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18)),
+          centerTitle: false,
+          actions: [
             IconButton(
-              tooltip: 'Kelola Halaman (Sisipkan, Putar, Pindah, Hapus)',
-              icon: const Icon(Icons.layers_outlined),
-              onPressed: _openPageManagerModal,
+              tooltip: 'Buka File PDF',
+              icon: const Icon(Icons.folder_open_outlined),
+              onPressed: _pickPdfFile,
             ),
             IconButton(
-              tooltip: 'Kelola Tanda Tangan',
-              icon: const Icon(Icons.draw_outlined),
-              onPressed: _openSignatureManager,
+              tooltip: 'Riwayat File Dibuka',
+              icon: const Icon(Icons.history),
+              onPressed: _openHistoryModal,
             ),
-            IconButton(
-              tooltip: 'Save (Simpan)',
-              onPressed: () => _exportSignedPdf(saveAs: false),
-              icon: const Icon(Icons.save_outlined),
-            ),
-            IconButton(
-              tooltip: 'Save As (Simpan Sebagai)',
-              onPressed: () => _exportSignedPdf(saveAs: true),
-              icon: const Icon(Icons.save_as_outlined),
-            ),
-          ],
-          PopupMenuButton<ThemeMode>(
-            tooltip: 'Tema Tampilan',
-            icon: Icon(
-              widget.currentThemeMode == ThemeMode.dark
-                  ? Icons.dark_mode_outlined
-                  : widget.currentThemeMode == ThemeMode.light
-                      ? Icons.light_mode_outlined
-                      : Icons.brightness_auto_outlined,
-            ),
-            onSelected: widget.onThemeChanged,
-            itemBuilder: (context) => [
-              CheckedPopupMenuItem(
-                value: ThemeMode.system,
-                checked: widget.currentThemeMode == ThemeMode.system,
-                child: const Text('Ikuti Sistem'),
+            if (_filePath != null) ...[
+              IconButton(
+                tooltip: 'Bagikan Dokumen (Share)',
+                icon: const Icon(Icons.share_outlined),
+                onPressed: _shareCurrentPdf,
               ),
-              CheckedPopupMenuItem(
-                value: ThemeMode.light,
-                checked: widget.currentThemeMode == ThemeMode.light,
-                child: const Text('Mode Terang (Light)'),
+              IconButton(
+                tooltip: 'Kelola Halaman',
+                icon: const Icon(Icons.layers_outlined),
+                onPressed: _openPageManagerModal,
               ),
-              CheckedPopupMenuItem(
-                value: ThemeMode.dark,
-                checked: widget.currentThemeMode == ThemeMode.dark,
-                child: const Text('Mode Gelap (Dark)'),
+              IconButton(
+                tooltip: 'Kelola Tanda Tangan',
+                icon: const Icon(Icons.draw_outlined),
+                onPressed: _openSignatureManager,
+              ),
+              IconButton(
+                tooltip: 'Save (Simpan)',
+                onPressed: () => _exportSignedPdf(saveAs: false),
+                icon: const Icon(Icons.save_outlined),
+              ),
+              IconButton(
+                tooltip: 'Save As (Simpan Sebagai)',
+                onPressed: () => _exportSignedPdf(saveAs: true),
+                icon: const Icon(Icons.save_as_outlined),
               ),
             ],
-          ),
-          const SizedBox(width: 4),
-        ],
-      ),
-      body: Stack(
-        children: [
-          _filePath == null
-              ? Center(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 440),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Card(
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(20),
-                              side: BorderSide(
-                                color: Theme.of(context).colorScheme.outlineVariant,
-                              ),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(28.0),
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.all(18),
-                                    decoration: BoxDecoration(
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .primaryContainer
-                                          .withValues(alpha: 0.5),
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: Icon(
-                                      Icons.picture_as_pdf_outlined,
-                                      size: 44,
-                                      color: Theme.of(context).colorScheme.primary,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 16),
-                                  Text(
-                                    'Belum Ada Dokumen',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .titleMedium
-                                        ?.copyWith(fontWeight: FontWeight.bold),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    'Buka file PDF untuk membaca, mengatur halaman, atau membubuhkan tanda tangan digital.',
-                                    textAlign: TextAlign.center,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(
-                                          color: Theme.of(context).colorScheme.outline,
-                                        ),
-                                  ),
-                                  const SizedBox(height: 20),
-                                  SizedBox(
-                                    width: double.infinity,
-                                    child: FilledButton.icon(
-                                      onPressed: _pickPdfFile,
-                                      icon: const Icon(Icons.file_open_outlined),
-                                      label: const Text('Pilih File PDF'),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          if (_recentFiles.isNotEmpty) ...[
-                            const SizedBox(height: 16),
+            PopupMenuButton<ThemeMode>(
+              tooltip: 'Tema Tampilan',
+              icon: Icon(
+                widget.currentThemeMode == ThemeMode.dark
+                    ? Icons.dark_mode_outlined
+                    : widget.currentThemeMode == ThemeMode.light
+                        ? Icons.light_mode_outlined
+                        : Icons.brightness_auto_outlined,
+              ),
+              onSelected: widget.onThemeChanged,
+              itemBuilder: (context) => [
+                const CheckedPopupMenuItem(value: ThemeMode.system, child: Text('Ikuti Sistem')),
+                const CheckedPopupMenuItem(value: ThemeMode.light, child: Text('Mode Terang')),
+                const CheckedPopupMenuItem(value: ThemeMode.dark, child: Text('Mode Gelap')),
+              ],
+            ),
+            const SizedBox(width: 4),
+          ],
+        ),
+        body: Stack(
+          children: [
+            _filePath == null
+                ? Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(16),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 440),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
                             Card(
                               elevation: 0,
                               shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(16),
-                                side: BorderSide(
-                                  color: Theme.of(context).colorScheme.outlineVariant,
-                                ),
+                                borderRadius: BorderRadius.circular(20),
+                                side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
                               ),
                               child: Padding(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 16, vertical: 12),
+                                padding: const EdgeInsets.all(28.0),
                                 child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    Row(
-                                      children: [
-                                        const Icon(Icons.history, size: 18),
-                                        const SizedBox(width: 8),
-                                        const Text(
-                                          'Terakhir Dibuka',
-                                          style: TextStyle(fontWeight: FontWeight.bold),
-                                        ),
-                                        const Spacer(),
-                                        TextButton(
-                                          onPressed: _openHistoryModal,
-                                          child: const Text('Lihat Semua'),
-                                        ),
-                                      ],
+                                    Container(
+                                      padding: const EdgeInsets.all(18),
+                                      decoration: BoxDecoration(
+                                        color: Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.5),
+                                        shape: BoxShape.circle,
+                                      ),
+                                      child: Icon(Icons.picture_as_pdf_outlined, size: 44, color: Theme.of(context).colorScheme.primary),
                                     ),
-                                    ..._recentFiles.take(4).map((item) {
-                                      final path = item['path'] ?? '';
-                                      final name = item['name'] ?? 'Dokumen.pdf';
-                                      final time = item['time'] ?? '';
-                                      return ListTile(
-                                        dense: true,
-                                        contentPadding: EdgeInsets.zero,
-                                        leading: Icon(
-                                          Icons.picture_as_pdf,
-                                          color: Theme.of(context).colorScheme.primary,
-                                        ),
-                                        title: Text(
-                                          name,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(
-                                              fontWeight: FontWeight.w600),
-                                        ),
-                                        subtitle: Text(
-                                          time,
-                                          style: const TextStyle(fontSize: 11),
-                                        ),
-                                        trailing: IconButton(
-                                          icon: const Icon(Icons.close, size: 16),
-                                          onPressed: () => _removeRecentFile(path),
-                                        ),
-                                        onTap: () => _openPdfFromPath(path),
-                                      );
-                                    }),
+                                    const SizedBox(height: 16),
+                                    Text('Belum Ada Dokumen', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      'Buka file PDF untuk membaca, mengatur halaman, atau membubuhkan tanda tangan digital.',
+                                      textAlign: TextAlign.center,
+                                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.outline),
+                                    ),
+                                    const SizedBox(height: 20),
+                                    SizedBox(
+                                      width: double.infinity,
+                                      child: FilledButton.icon(
+                                        onPressed: _pickPdfFile,
+                                        icon: const Icon(Icons.file_open_outlined),
+                                        label: const Text('Pilih File PDF'),
+                                      ),
+                                    ),
                                   ],
                                 ),
                               ),
                             ),
                           ],
-                        ],
+                        ),
                       ),
                     ),
-                  ),
-                )
-              : GestureDetector(
-                  onTap: () => setState(() => _selectedSigId = null),
-                  child: PdfViewer.file(
-                    _filePath!,
-                    controller: _pdfController,
-                    params: PdfViewerParams(
-                      maxScale: 5.0,
-                      minScale: 0.5,
-                      onViewerReady: (document, controller) {
-                        setState(() {
-                          _totalPages = document.pages.length;
-                          _currentPage = controller.pageNumber ?? 1;
-                        });
-                      },
-                      onPageChanged: (pageNumber) {
-                        if (pageNumber != null) {
+                  )
+                : GestureDetector(
+                    onTap: () => setState(() => _selectedSigId = null),
+                    child: PdfViewer.file(
+                      _filePath!,
+                      controller: _pdfController,
+                      params: PdfViewerParams(
+                        maxScale: 5.0,
+                        minScale: 0.5,
+                        onViewerReady: (document, controller) {
                           setState(() {
-                            _currentPage = pageNumber;
+                            _totalPages = document.pages.length;
+                            _currentPage = controller.pageNumber ?? 1;
                           });
-                        }
-                      },
-                      viewerOverlayBuilder: (context, size, handleLinkTap) => [
-                        PdfViewerScrollThumb(
-                          controller: _pdfController,
-                          orientation: ScrollbarOrientation.right,
-                          thumbSize: const Size(44, 28),
-                          thumbBuilder:
-                              (context, thumbSize, pageNumber, controller) =>
-                                  Container(
-                            decoration: BoxDecoration(
-                              color: Theme.of(context).colorScheme.primary,
-                              borderRadius: const BorderRadius.horizontal(
-                                left: Radius.circular(14),
+                        },
+                        onPageChanged: (pageNumber) {
+                          if (pageNumber != null) setState(() => _currentPage = pageNumber);
+                        },
+                        viewerOverlayBuilder: (context, size, handleLinkTap) => [
+                          PdfViewerScrollThumb(
+                            controller: _pdfController,
+                            orientation: ScrollbarOrientation.right,
+                            thumbSize: const Size(44, 28),
+                            thumbBuilder: (context, thumbSize, pageNumber, controller) => Container(
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).colorScheme.primary,
+                                borderRadius: const BorderRadius.horizontal(left: Radius.circular(14)),
+                                boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
                               ),
-                              boxShadow: const [
-                                BoxShadow(color: Colors.black26, blurRadius: 4),
-                              ],
-                            ),
-                            alignment: Alignment.center,
-                            child: Text(
-                              '${pageNumber ?? _currentPage}',
-                              style: TextStyle(
-                                color: Theme.of(context).colorScheme.onPrimary,
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold,
+                              alignment: Alignment.center,
+                              child: Text(
+                                '${pageNumber ?? _currentPage}',
+                                style: TextStyle(
+                                  color: Theme.of(context).colorScheme.onPrimary,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        PdfViewerScrollThumb(
-                          controller: _pdfController,
-                          orientation: ScrollbarOrientation.bottom,
-                          thumbSize: const Size(50, 14),
-                          thumbBuilder:
-                              (context, thumbSize, pageNumber, controller) =>
-                                  Container(
-                            margin: const EdgeInsets.only(bottom: 4),
-                            decoration: BoxDecoration(
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .primary
-                                  .withValues(alpha: 0.6),
-                              borderRadius: BorderRadius.circular(7),
-                            ),
-                          ),
-                        ),
-                      ],
-                      pageOverlaysBuilder: (context, pageRect, page) {
-                        final sigsOnPage = _placedSignatures
-                            .where((s) => s.pageNumber == page.pageNumber)
-                            .toList();
+                        ],
+                        pageOverlaysBuilder: (context, pageRect, page) {
+                          final sigsOnPage = _placedSignatures.where((s) => s.pageNumber == page.pageNumber).toList();
+                          List<Widget> overlays = [];
 
-                        List<Widget> overlays = [];
+                          if (_activeSignatureBytes != null) {
+                            overlays.add(
+                              Positioned.fill(
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTapDown: (details) {
+                                    final bytes = _activeSignatureBytes!;
+                                    ui.decodeImageFromList(bytes, (ui.Image img) {
+                                      final aspect = img.width / img.height;
+                                      final tapX = details.localPosition.dx / pageRect.width;
+                                      final tapY = details.localPosition.dy / pageRect.height;
 
-                        if (_activeSignatureBytes != null) {
-                          overlays.add(
-                            Positioned.fill(
-                              child: GestureDetector(
-                                behavior: HitTestBehavior.opaque,
-                                onTapDown: (details) {
-                                  final bytes = _activeSignatureBytes!;
-                                  ui.decodeImageFromList(bytes, (ui.Image img) {
-                                    final aspect = img.width / img.height;
+                                      const initRelWidth = 0.24;
+                                      final initPixelWidth = initRelWidth * pageRect.width;
+                                      final initPixelHeight = initPixelWidth / aspect;
+                                      final initRelHeight = initPixelHeight / pageRect.height;
 
-                                    final tapX =
-                                        details.localPosition.dx / pageRect.width;
-                                    final tapY =
-                                        details.localPosition.dy / pageRect.height;
+                                      final newSig = PlacedSignature(
+                                        id: DateTime.now().microsecondsSinceEpoch.toString(),
+                                        pageNumber: page.pageNumber,
+                                        imageBytes: bytes,
+                                        aspectRatio: aspect,
+                                        relX: (tapX - (initRelWidth / 2)).clamp(0.0, 1.0 - initRelWidth),
+                                        relY: (tapY - (initRelHeight / 2)).clamp(0.0, 1.0 - initRelHeight),
+                                        relWidth: initRelWidth,
+                                        relHeight: initRelHeight,
+                                        rotation: 0.0,
+                                      );
 
-                                    const initRelWidth = 0.24;
-                                    final initPixelWidth =
-                                        initRelWidth * pageRect.width;
-                                    final initPixelHeight =
-                                        initPixelWidth / aspect;
-                                    final initRelHeight =
-                                        initPixelHeight / pageRect.height;
-
-                                    final newSig = PlacedSignature(
-                                      id: DateTime.now()
-                                          .microsecondsSinceEpoch
-                                          .toString(),
-                                      pageNumber: page.pageNumber,
-                                      imageBytes: bytes,
-                                      aspectRatio: aspect,
-                                      relX: (tapX - (initRelWidth / 2))
-                                          .clamp(0.0, 1.0 - initRelWidth),
-                                      relY: (tapY - (initRelHeight / 2))
-                                          .clamp(0.0, 1.0 - initRelHeight),
-                                      relWidth: initRelWidth,
-                                      relHeight: initRelHeight,
-                                      rotation: 0.0,
-                                    );
-
-                                    setState(() {
-                                      _placedSignatures.add(newSig);
-                                      _selectedSigId = newSig.id;
-                                      _activeSignatureBytes = null;
+                                      setState(() {
+                                        _placedSignatures.add(newSig);
+                                        _selectedSigId = newSig.id;
+                                        _activeSignatureBytes = null;
+                                      });
                                     });
-                                  });
-                                },
-                                child: Container(
-                                  color: Colors.indigo.withValues(alpha: 0.08),
-                                  alignment: Alignment.topCenter,
-                                  padding: const EdgeInsets.all(8),
-                                  child: Chip(
-                                    backgroundColor:
-                                        Theme.of(context).colorScheme.primary,
-                                    label: Text(
-                                      'Klik di sini untuk menempelkan Tanda Tangan (Hal ${page.pageNumber})',
-                                      style: TextStyle(
-                                          color: Theme.of(context)
-                                              .colorScheme
-                                              .onPrimary),
+                                  },
+                                  child: Container(
+                                    color: Colors.indigo.withValues(alpha: 0.08),
+                                    alignment: Alignment.topCenter,
+                                    padding: const EdgeInsets.all(8),
+                                    child: Chip(
+                                      backgroundColor: Theme.of(context).colorScheme.primary,
+                                      label: Text(
+                                        'Ketuk untuk menempelkan Tanda Tangan (Hal ${page.pageNumber})',
+                                        style: TextStyle(color: Theme.of(context).colorScheme.onPrimary),
+                                      ),
                                     ),
                                   ),
                                 ),
                               ),
-                            ),
-                          );
-                        }
+                            );
+                          }
 
-                        for (final sig in sigsOnPage) {
-                          final isSelected = _selectedSigId == sig.id;
-                          final width = sig.relWidth * pageRect.width;
-                          final height = sig.relHeight * pageRect.height;
+                          for (final sig in sigsOnPage) {
+                            final isSelected = _selectedSigId == sig.id;
+                            final width = sig.relWidth * pageRect.width;
+                            final height = sig.relHeight * pageRect.height;
+                            final left = sig.relX * pageRect.width;
+                            final top = sig.relY * pageRect.height;
 
-                          final left = sig.relX * pageRect.width;
-                          final top = sig.relY * pageRect.height;
-
-                          overlays.add(
-                            Positioned(
-                              left: left,
-                              top: top,
-                              width: width,
-                              height: height,
-                              child: Transform.rotate(
-                                angle: sig.rotation,
-                                alignment: Alignment.center,
-                                child: GestureDetector(
-                                  onTap: () {
-                                    setState(() => _selectedSigId = sig.id);
-                                  },
-                                  onPanUpdate: (details) {
-                                    setState(() {
-                                      _selectedSigId = sig.id;
-                                      sig.relX = (sig.relX +
-                                              details.delta.dx / pageRect.width)
-                                          .clamp(
-                                              0.0,
-                                              (1.0 - sig.relWidth)
-                                                  .clamp(0.0, 1.0));
-                                      sig.relY = (sig.relY +
-                                              details.delta.dy /
-                                                  pageRect.height)
-                                          .clamp(
-                                              0.0,
-                                              (1.0 - sig.relHeight)
-                                                  .clamp(0.0, 1.0));
-                                    });
-                                  },
-                                  child: Stack(
-                                    clipBehavior: Clip.none,
-                                    children: [
-                                      Container(
-                                        decoration: BoxDecoration(
-                                          border: isSelected
-                                              ? Border.all(
-                                                  color: Colors.blueAccent,
-                                                  width: 1.5,
-                                                )
-                                              : null,
-                                          color: isSelected
-                                              ? Colors.blue
-                                                  .withValues(alpha: 0.05)
-                                              : Colors.transparent,
-                                        ),
-                                        child: SizedBox.expand(
-                                          child: Image.memory(
-                                            sig.imageBytes,
-                                            fit: BoxFit.fill,
+                            overlays.add(
+                              Positioned(
+                                left: left,
+                                top: top,
+                                width: width,
+                                height: height,
+                                child: Transform.rotate(
+                                  angle: sig.rotation,
+                                  alignment: Alignment.center,
+                                  child: GestureDetector(
+                                    onTap: () => setState(() => _selectedSigId = sig.id),
+                                    onPanUpdate: (details) {
+                                      setState(() {
+                                        _selectedSigId = sig.id;
+                                        sig.relX = (sig.relX + details.delta.dx / pageRect.width).clamp(0.0, (1.0 - sig.relWidth).clamp(0.0, 1.0));
+                                        sig.relY = (sig.relY + details.delta.dy / pageRect.height).clamp(0.0, (1.0 - sig.relHeight).clamp(0.0, 1.0));
+                                      });
+                                    },
+                                    child: Stack(
+                                      clipBehavior: Clip.none,
+                                      children: [
+                                        Container(
+                                          decoration: BoxDecoration(
+                                            border: isSelected ? Border.all(color: Colors.blueAccent, width: 1.5) : null,
+                                            color: isSelected ? Colors.blue.withValues(alpha: 0.05) : Colors.transparent,
+                                          ),
+                                          child: SizedBox.expand(
+                                            child: Image.memory(sig.imageBytes, fit: BoxFit.fill),
                                           ),
                                         ),
-                                      ),
-                                      if (isSelected) ...[
-                                        Align(
-                                          alignment: Alignment.topCenter,
-                                          child: Transform.translate(
-                                            offset: const Offset(0, -16),
-                                            child: MouseRegion(
-                                              cursor: SystemMouseCursors.alias,
-                                              child: GestureDetector(
-                                                behavior:
-                                                    HitTestBehavior.opaque,
-                                                onPanUpdate: (details) {
-                                                  setState(() {
-                                                    sig.rotation +=
-                                                        details.delta.dx * 0.03;
-                                                  });
-                                                },
-                                                child: Padding(
-                                                  padding:
-                                                      const EdgeInsets.all(10.0),
-                                                  child: Container(
-                                                    width: 24,
-                                                    height: 24,
-                                                    decoration: BoxDecoration(
-                                                      color: Colors.blueAccent,
-                                                      shape: BoxShape.circle,
-                                                      border: Border.all(
-                                                          color: Colors.white,
-                                                          width: 2),
-                                                      boxShadow: const [
-                                                        BoxShadow(
-                                                          color: Colors.black38,
-                                                          blurRadius: 3,
-                                                          offset: Offset(0, 1),
-                                                        ),
-                                                      ],
-                                                    ),
-                                                    child: const Icon(
-                                                      Icons.rotate_right,
-                                                      size: 14,
-                                                      color: Colors.white,
-                                                    ),
-                                                  ),
-                                                ),
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        Positioned(
-                                          top: -10,
-                                          right: -10,
-                                          child: GestureDetector(
-                                            onTap: () {
-                                              setState(() {
-                                                _placedSignatures.remove(sig);
-                                              });
-                                            },
-                                            child: const CircleAvatar(
-                                              radius: 10,
-                                              backgroundColor: Colors.redAccent,
-                                              child: Icon(
-                                                Icons.close,
-                                                size: 12,
-                                                color: Colors.white,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        _buildResizeHandle(
-                                          alignment: Alignment.centerRight,
-                                          onDrag: (delta) {
-                                            setState(() {
-                                              sig.relWidth = (sig.relWidth +
-                                                      delta.dx / pageRect.width)
-                                                  .clamp(0.05, 0.9);
-                                            });
-                                          },
-                                        ),
-                                        _buildResizeHandle(
-                                          alignment: Alignment.bottomCenter,
-                                          onDrag: (delta) {
-                                            setState(() {
-                                              sig.relHeight = (sig.relHeight +
-                                                      delta.dy /
-                                                          pageRect.height)
-                                                  .clamp(0.03, 0.9);
-                                            });
-                                          },
-                                        ),
-                                        Positioned(
-                                          right: -6,
-                                          bottom: -6,
-                                          child: MouseRegion(
-                                            cursor: SystemMouseCursors
-                                                .resizeUpLeftDownRight,
-                                            child: GestureDetector(
-                                              behavior: HitTestBehavior.opaque,
-                                              onPanUpdate: (details) {
-                                                setState(() {
-                                                  final newRelWidth =
-                                                      (sig.relWidth +
-                                                              details.delta.dx /
-                                                                  pageRect
-                                                                      .width)
-                                                          .clamp(0.04, 0.9);
-                                                  final newPixelWidth =
-                                                      newRelWidth *
-                                                          pageRect.width;
-                                                  final newPixelHeight =
-                                                      newPixelWidth /
-                                                          sig.aspectRatio;
-                                                  final newRelHeight =
-                                                      newPixelHeight /
-                                                          pageRect.height;
-
-                                                  if (newRelHeight <= 0.95) {
-                                                    sig.relWidth = newRelWidth;
-                                                    sig.relHeight =
-                                                        newRelHeight;
-                                                  }
-                                                });
-                                              },
-                                              child: Container(
-                                                padding:
-                                                    const EdgeInsets.all(8),
-                                                color: Colors.transparent,
-                                                child: Container(
-                                                  width: 12,
-                                                  height: 12,
-                                                  decoration: BoxDecoration(
-                                                    color: Colors.blueAccent,
-                                                    shape: BoxShape.circle,
-                                                    border: Border.all(
-                                                        color: Colors.white,
-                                                        width: 2),
-                                                    boxShadow: const [
-                                                      BoxShadow(
-                                                        color: Colors.black26,
-                                                        blurRadius: 2,
-                                                        offset: Offset(0, 1),
+                                        if (isSelected) ...[
+                                          Align(
+                                            alignment: Alignment.topCenter,
+                                            child: Transform.translate(
+                                              offset: const Offset(0, -16),
+                                              child: MouseRegion(
+                                                cursor: SystemMouseCursors.alias,
+                                                child: GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onPanUpdate: (details) {
+                                                    setState(() => sig.rotation += details.delta.dx * 0.03);
+                                                  },
+                                                  child: Padding(
+                                                    padding: const EdgeInsets.all(10.0),
+                                                    child: Container(
+                                                      width: 24,
+                                                      height: 24,
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.blueAccent,
+                                                        shape: BoxShape.circle,
+                                                        border: Border.all(color: Colors.white, width: 2),
                                                       ),
-                                                    ],
+                                                      child: const Icon(Icons.rotate_right, size: 14, color: Colors.white),
+                                                    ),
                                                   ),
                                                 ),
                                               ),
                                             ),
                                           ),
-                                        ),
+                                          Positioned(
+                                            top: -10,
+                                            right: -10,
+                                            child: GestureDetector(
+                                              onTap: () => setState(() => _placedSignatures.remove(sig)),
+                                              child: const CircleAvatar(
+                                                radius: 10,
+                                                backgroundColor: Colors.redAccent,
+                                                child: Icon(Icons.close, size: 12, color: Colors.white),
+                                              ),
+                                            ),
+                                          ),
+                                        ],
                                       ],
-                                    ],
+                                    ),
                                   ),
                                 ),
                               ),
-                            ),
-                          );
-                        }
-
-                        return overlays;
-                      },
-                    ),
-                  ),
-                ),
-          if (_activeSignatureBytes != null)
-            Positioned(
-              top: 12,
-              left: 12,
-              right: 12,
-              child: Center(
-                child: Material(
-                  elevation: 6,
-                  borderRadius: BorderRadius.circular(30),
-                  color: Theme.of(context).colorScheme.primaryContainer,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 6),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const Icon(Icons.touch_app, size: 20),
-                        const SizedBox(width: 8),
-                        Flexible(
-                          child: Text(
-                            'Mode Tempel Aktif. Ketuk halaman PDF!',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 13,
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .onPrimaryContainer,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        TextButton(
-                          onPressed: () =>
-                              setState(() => _activeSignatureBytes = null),
-                          child: const Text('Batal'),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ),
-        ],
-      ),
-      bottomNavigationBar: _filePath == null || _totalPages == 0
-          ? null
-          : Container(
-              height: 56,
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surfaceContainer,
-                border: Border(
-                  top: BorderSide(
-                    color: Theme.of(context).colorScheme.outlineVariant,
-                    width: 0.8,
-                  ),
-                ),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  IconButton(
-                    tooltip: 'Halaman Pertama',
-                    icon: const Icon(Icons.first_page),
-                    onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
-                  ),
-                  IconButton(
-                    tooltip: 'Halaman Sebelumnya',
-                    icon: const Icon(Icons.chevron_left),
-                    onPressed: _currentPage > 1
-                        ? () => _goToPage(_currentPage - 1)
-                        : null,
-                  ),
-                  const SizedBox(width: 8),
-                  InkWell(
-                    borderRadius: BorderRadius.circular(8),
-                    onTap: _showJumpPageDialog,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 6,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.surface,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: Theme.of(context).colorScheme.outlineVariant,
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            'Halaman $_currentPage / $_totalPages',
-                            style: const TextStyle(fontWeight: FontWeight.w600),
-                          ),
-                          const SizedBox(width: 6),
-                          Icon(
-                            Icons.edit_location_alt_outlined,
-                            size: 16,
-                            color: Theme.of(context).colorScheme.primary,
-                          ),
-                        ],
+                            );
+                          }
+                          return overlays;
+                        },
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  IconButton(
-                    tooltip: 'Halaman Berikutnya',
-                    icon: const Icon(Icons.chevron_right),
-                    onPressed: _currentPage < _totalPages
-                        ? () => _goToPage(_currentPage + 1)
-                        : null,
-                  ),
-                  IconButton(
-                    tooltip: 'Halaman Terakhir',
-                    icon: const Icon(Icons.last_page),
-                    onPressed: _currentPage < _totalPages
-                        ? () => _goToPage(_totalPages)
-                        : null,
-                  ),
-                ],
-              ),
-            ),
-    );
-  }
-
-  Widget _buildResizeHandle({
-    required Alignment alignment,
-    required ValueChanged<Offset> onDrag,
-  }) {
-    MouseCursor cursor = SystemMouseCursors.basic;
-    if (alignment == Alignment.centerLeft ||
-        alignment == Alignment.centerRight) {
-      cursor = SystemMouseCursors.resizeLeftRight;
-    } else if (alignment == Alignment.topCenter ||
-        alignment == Alignment.bottomCenter) {
-      cursor = SystemMouseCursors.resizeUpDown;
-    } else if (alignment == Alignment.bottomRight) {
-      cursor = SystemMouseCursors.resizeUpLeftDownRight;
-    }
-
-    return Align(
-      alignment: alignment,
-      child: MouseRegion(
-        cursor: cursor,
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onPanUpdate: (details) => onDrag(details.delta),
-          child: Padding(
-            padding: const EdgeInsets.all(12.0),
-            child: Container(
-              width: 12,
-              height: 12,
-              decoration: BoxDecoration(
-                color: Colors.white,
-                border: Border.all(color: Colors.blueAccent, width: 2),
-                shape: BoxShape.circle,
-                boxShadow: const [
-                  BoxShadow(
-                    color: Colors.black26,
-                    blurRadius: 2,
-                    offset: Offset(0, 1),
-                  ),
-                ],
-              ),
-            ),
-          ),
+          ],
         ),
+        bottomNavigationBar: _filePath == null || _totalPages == 0
+            ? null
+            : Container(
+                height: 56,
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainer,
+                  border: Border(
+                    top: BorderSide(color: Theme.of(context).colorScheme.outlineVariant, width: 0.8),
+                  ),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.first_page),
+                      onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.chevron_left),
+                      onPressed: _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
+                    ),
+                    const SizedBox(width: 8),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(8),
+                      onTap: _showJumpPageDialog,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.surface,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                        ),
+                        child: Text('Halaman $_currentPage / $_totalPages', style: const TextStyle(fontWeight: FontWeight.w600)),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton(
+                      icon: const Icon(Icons.chevron_right),
+                      onPressed: _currentPage < _totalPages ? () => _goToPage(_currentPage + 1) : null,
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.last_page),
+                      onPressed: _currentPage < _totalPages ? () => _goToPage(_totalPages) : null,
+                    ),
+                  ],
+                ),
+              ),
       ),
     );
   }
@@ -2725,16 +2049,11 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
 
   Future<Uint8List?> _exportToPngBytes() async {
     if (_strokes.isEmpty) return null;
-
     final box = _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     final size = box?.size ?? const Size(450, 220);
 
     final recorder = ui.PictureRecorder();
-    final canvas = Canvas(
-      recorder,
-      Rect.fromLTWH(0, 0, size.width, size.height),
-    );
-
+    final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, size.width, size.height));
     final paint = Paint()
       ..color = _penColor
       ..strokeCap = StrokeCap.round
@@ -2745,9 +2064,7 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
     for (final stroke in _strokes) {
       if (stroke.length > 1) {
         final path = Path()..moveTo(stroke.first.dx, stroke.first.dy);
-        for (int i = 1; i < stroke.length; i++) {
-          path.lineTo(stroke[i].dx, stroke[i].dy);
-        }
+        for (int i = 1; i < stroke.length; i++) path.lineTo(stroke[i].dx, stroke[i].dy);
         canvas.drawPath(path, paint);
       } else if (stroke.isNotEmpty) {
         canvas.drawPoints(ui.PointMode.points, stroke, paint);
@@ -2764,7 +2081,6 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
   Widget build(BuildContext context) {
     return AlertDialog(
       title: const Text('Gambar Tanda Tangan'),
-      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
       content: SizedBox(
         width: 450,
         child: Column(
@@ -2773,9 +2089,6 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
           children: [
             Wrap(
               alignment: WrapAlignment.spaceBetween,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 8,
-              runSpacing: 4,
               children: [
                 Row(
                   mainAxisSize: MainAxisSize.min,
@@ -2803,31 +2116,18 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                  color: Theme.of(context).colorScheme.outlineVariant,
-                  width: 1.5,
-                ),
+                border: Border.all(color: Theme.of(context).colorScheme.outlineVariant, width: 1.5),
               ),
               child: ClipRRect(
                 borderRadius: BorderRadius.circular(12),
                 child: GestureDetector(
-                  onPanStart: (details) {
-                    setState(() {
-                      _currentStroke = [details.localPosition];
-                      _strokes.add(_currentStroke);
-                    });
-                  },
-                  onPanUpdate: (details) {
-                    setState(() {
-                      _currentStroke.add(details.localPosition);
-                    });
-                  },
+                  onPanStart: (details) => setState(() {
+                    _currentStroke = [details.localPosition];
+                    _strokes.add(_currentStroke);
+                  }),
+                  onPanUpdate: (details) => setState(() => _currentStroke.add(details.localPosition)),
                   child: CustomPaint(
-                    painter: _SignaturePainter(
-                      strokes: _strokes,
-                      color: _penColor,
-                      strokeWidth: _strokeWidth,
-                    ),
+                    painter: _SignaturePainter(strokes: _strokes, color: _penColor, strokeWidth: _strokeWidth),
                     size: Size.infinite,
                   ),
                 ),
@@ -2837,16 +2137,11 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
         ),
       ),
       actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(context),
-          child: const Text('Batal'),
-        ),
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
         FilledButton.icon(
           onPressed: () async {
             final bytes = await _exportToPngBytes();
-            if (context.mounted) {
-              Navigator.pop(context, bytes);
-            }
+            if (context.mounted) Navigator.pop(context, bytes);
           },
           icon: const Icon(Icons.check),
           label: const Text('Simpan Tanda Tangan'),
@@ -2856,7 +2151,6 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
   }
 
   Widget _buildColorCircle(Color color, String tooltip) {
-    final isSelected = _penColor == color;
     return Tooltip(
       message: tooltip,
       child: GestureDetector(
@@ -2864,9 +2158,7 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
         child: CircleAvatar(
           radius: 14,
           backgroundColor: color,
-          child: isSelected
-              ? const Icon(Icons.check, size: 16, color: Colors.white)
-              : null,
+          child: _penColor == color ? const Icon(Icons.check, size: 16, color: Colors.white) : null,
         ),
       ),
     );
@@ -2878,11 +2170,7 @@ class _SignaturePainter extends CustomPainter {
   final Color color;
   final double strokeWidth;
 
-  _SignaturePainter({
-    required this.strokes,
-    required this.color,
-    required this.strokeWidth,
-  });
+  _SignaturePainter({required this.strokes, required this.color, required this.strokeWidth});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -2896,9 +2184,7 @@ class _SignaturePainter extends CustomPainter {
     for (final stroke in strokes) {
       if (stroke.length > 1) {
         final path = Path()..moveTo(stroke.first.dx, stroke.first.dy);
-        for (int i = 1; i < stroke.length; i++) {
-          path.lineTo(stroke[i].dx, stroke[i].dy);
-        }
+        for (int i = 1; i < stroke.length; i++) path.lineTo(stroke[i].dx, stroke[i].dy);
         canvas.drawPath(path, paint);
       } else if (stroke.isNotEmpty) {
         canvas.drawPoints(ui.PointMode.points, stroke, paint);
