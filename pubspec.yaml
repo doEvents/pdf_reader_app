@@ -1,5 +1,5 @@
-name: pdf_reader_app
-description: "A new Flutter project."
+name: fajar_pdf_reader
+description: "PDF Reader"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -36,10 +36,14 @@ dependencies:
   cupertino_icons: ^1.0.8
   pdfrx: ^2.9.0
   file_picker: ^13.1.0
+  syncfusion_flutter_pdf: ^35.1.41
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+    # Tambahkan baris ini:
+  flutter_launcher_icons: "^0.13.1"
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
@@ -89,3 +93,12 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/app_icon.png" # Path ke gambar master yang Abang buat
+  windows:
+    icon_size: 48 # Ukuran standar untuk Windows
+    generate: true
+  macos:
+    generate: true
