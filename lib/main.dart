@@ -1,14 +1,17 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+//import 'dart:typed_data';
 import 'dart:ui' as ui;
-
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart' as sf;
 import 'package:share_plus/share_plus.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
+import 'package:printing/printing.dart';
+import 'package:archive/archive.dart';
 
 void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,6 +37,34 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   ThemeMode _themeMode = ThemeMode.system;
+  String? _sharedFilepath;
+
+  @override
+  void initState() {
+    super.initState();
+    _sharedFilepath = widget.initialFilepath;
+
+    if (Platform.isAndroid || Platform.isIOS) {
+      ReceiveSharingIntent.instance.getInitialMedia().then((value) {
+        if (value.isNotEmpty && value.first.path.isNotEmpty) {
+          setState(() {
+            _sharedFilepath = value.first.path;
+          });
+        }
+        ReceiveSharingIntent.instance.reset();
+      });
+
+      ReceiveSharingIntent.instance.getMediaStream().listen((value) {
+        if (value.isNotEmpty && value.first.path.isNotEmpty) {
+          setState(() {
+            _sharedFilepath = value.first.path;
+          });
+        }
+      }, onError: (err) {
+        debugPrint("Error sharing intent: $err");
+      });
+    }
+  }
 
   void _changeTheme(ThemeMode mode) {
     setState(() {
@@ -64,7 +95,7 @@ class _MyAppState extends State<MyApp> {
       home: PdfViewerScreen(
         currentThemeMode: _themeMode,
         onThemeChanged: _changeTheme,
-        initialFilepath: widget.initialFilepath,
+        initialFilepath: _sharedFilepath,
       ),
     );
   }
@@ -124,6 +155,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   int _currentPage = 1;
   int _totalPages = 0;
+  double _currentZoom = 1.0;
+  PdfTextSearcher? _textSearcher;
+  bool _isSearching = false;
+  final TextEditingController _searchController = TextEditingController();
 
   @override
   void initState() {
@@ -138,10 +173,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
+  @override
+  void didUpdateWidget(covariant PdfViewerScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.initialFilepath != null && widget.initialFilepath != oldWidget.initialFilepath) {
+      _openPdfFromPath(widget.initialFilepath!);
+    }
+  }
+
   void _goToPage(int page) {
     if (_pdfController.isReady && _totalPages > 0) {
       final target = page.clamp(1, _totalPages);
       _pdfController.goToPage(pageNumber: target);
+    }
+  }
+
+  void _setZoomValue(double val) {
+    if (_pdfController.isReady) {
+      final clamped = val.clamp(0.5, 4.0);
+      setState(() => _currentZoom = clamped);
+      _pdfController.setZoom(Offset.zero, clamped);
+    }
+  }
+
+  void _zoomIn() {
+    if (_pdfController.isReady) {
+      _setZoomValue(_currentZoom + 0.25);
+    }
+  }
+
+  void _zoomOut() {
+    if (_pdfController.isReady) {
+      _setZoomValue(_currentZoom - 0.25);
+    }
+  }
+
+  void _resetZoom() {
+    if (_pdfController.isReady) {
+      _setZoomValue(1.0);
     }
   }
 
@@ -152,13 +221,13 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Lompat ke Halaman'),
+        title: const Text('Jump to Page'),
         content: TextField(
           controller: textController,
           keyboardType: TextInputType.number,
           autofocus: true,
           decoration: InputDecoration(
-            labelText: 'Masukkan nomor halaman (1 - $_totalPages)',
+            labelText: 'Enter page number (1 - $_totalPages)',
             border: const OutlineInputBorder(),
           ),
           onSubmitted: (val) {
@@ -170,7 +239,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx),
-            child: const Text('Batal'),
+            child: const Text('Cancel'),
           ),
           FilledButton(
             onPressed: () {
@@ -178,7 +247,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
               if (page != null) _goToPage(page);
               Navigator.pop(ctx);
             },
-            child: const Text('Lompat'),
+            child: const Text('Jump'),
           ),
         ],
       ),
@@ -253,7 +322,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   void _openPdfFromPath(String path) {
     final file = File(path);
     if (!file.existsSync()) {
-      _showToast('File tidak ditemukan atau sudah dipindahkan.');
+      _showToast('File not found or has been moved.');
       _removeRecentFile(path);
       return;
     }
@@ -267,49 +336,449 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _activeSignatureBytes = null;
       _currentPage = 1;
       _totalPages = 0;
+      _currentZoom = 1.0;
+      _isSearching = false;
+      _searchController.clear();
+      _textSearcher?.resetTextSearch();
+      _textSearcher = null;
     });
     _addToRecentFiles(path, name);
   }
 
-  /// Fungsi Bagikan File (Android, Windows, macOS) via share_plus
   Future<void> _shareCurrentPdf() async {
     if (_filePath == null) return;
     try {
       final xFile = XFile(_filePath!);
-      await Share.shareXFiles([xFile], text: 'Dokumen PDF: $_fileName');
+      await Share.shareXFiles([xFile], text: 'PDF Document: $_fileName');
     } catch (e) {
-      _showToast('Gagal membagikan file: $e');
+      _showToast('Failed to share file: $e');
     }
   }
 
-  /// Cek konfirmasi jika ada perubahan/tanda tangan belum disimpan saat keluar/tutup
-  Future<bool> _onWillPop() async {
-    if (_filePath == null || _placedSignatures.isEmpty) {
-      return true; // Boleh keluar langsung
+  Future<void> _printCurrentPdf() async {
+    if (_filePath == null) return;
+    try {
+      final file = File(_filePath!);
+      if (!await file.exists()) {
+        _showToast('Document file not found.');
+        return;
+      }
+      final bytes = await file.readAsBytes();
+      await Printing.layoutPdf(
+        name: _fileName ?? 'Document',
+        onLayout: (format) async => bytes,
+      );
+    } catch (e) {
+      _showToast('Failed to print document: $e');
+    }
+  }
+
+  Future<void> _convertPdfToImages() async {
+    if (_filePath == null || _totalPages <= 0) return;
+
+    bool convertAll = true;
+    final pagesCtrl = TextEditingController(text: '1-$_totalPages');
+
+    final bool? proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return AlertDialog(
+              title: const Row(
+                children: [
+                  Icon(Icons.image_outlined, color: Colors.blueAccent),
+                  SizedBox(width: 10),
+                  Text('Convert PDF to Image'),
+                ],
+              ),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Pilih halaman yang ingin dikonversi ke gambar:'),
+                    const SizedBox(height: 12),
+                    RadioListTile<bool>(
+                      contentPadding: EdgeInsets.zero,
+                      title: Text('Semua Halaman (1 - $_totalPages)'),
+                      value: true,
+                      groupValue: convertAll,
+                      onChanged: (val) => setModalState(() => convertAll = val!),
+                    ),
+                    RadioListTile<bool>(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('Halaman Tertentu'),
+                      value: false,
+                      groupValue: convertAll,
+                      onChanged: (val) => setModalState(() => convertAll = val!),
+                    ),
+                    if (!convertAll) ...[
+                      const SizedBox(height: 4),
+                      Padding(
+                        padding: const EdgeInsets.only(left: 12, right: 12, bottom: 8),
+                        child: TextField(
+                          controller: pagesCtrl,
+                          autofocus: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Contoh: 1, 5, 7 atau 1-3, 5',
+                            hintText: '1, 5, 7',
+                            border: OutlineInputBorder(),
+                            isDense: true,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Batal'),
+                ),
+                FilledButton.icon(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  icon: const Icon(Icons.folder_open, size: 18),
+                  label: const Text('Pilih Folder & Konversi'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (proceed != true) return;
+
+    // Parsing daftar halaman yang dipilih
+    final List<int> targetPages = [];
+    if (convertAll) {
+      targetPages.addAll(List.generate(_totalPages, (i) => i + 1));
+    } else {
+      final input = pagesCtrl.text.replaceAll(' ', '');
+      final parts = input.split(',');
+      for (final part in parts) {
+        if (part.contains('-')) {
+          final range = part.split('-');
+          if (range.length == 2) {
+            final start = int.tryParse(range[0]);
+            final end = int.tryParse(range[1]);
+            if (start != null && end != null) {
+              final minP = start < end ? start : end;
+              final maxP = start > end ? start : end;
+              for (int p = minP; p <= maxP; p++) {
+                if (p >= 1 && p <= _totalPages && !targetPages.contains(p)) {
+                  targetPages.add(p);
+                }
+              }
+            }
+          }
+        } else {
+          final pageNum = int.tryParse(part);
+          if (pageNum != null && pageNum >= 1 && pageNum <= _totalPages && !targetPages.contains(pageNum)) {
+            targetPages.add(pageNum);
+          }
+        }
+      }
+      targetPages.sort();
     }
 
-    final bool? shouldClose = await showDialog<bool>(
+    if (targetPages.isEmpty) {
+      _showToast('Nomor halaman tidak valid.');
+      return;
+    }
+
+    try {
+      final String? selectedDirectory = await FilePicker.getDirectoryPath(
+        dialogTitle: 'Pilih Folder Tujuan Penyimpanan Gambar',
+      );
+
+      if (selectedDirectory == null || selectedDirectory.isEmpty) return;
+
+      final baseName = (_fileName ?? 'Document').replaceAll('.pdf', '');
+      final exportFolder = Directory('$selectedDirectory${Platform.pathSeparator}${baseName}_images');
+      if (!await exportFolder.exists()) await exportFolder.create(recursive: true);
+
+      final doc = await PdfDocument.openFile(_filePath!);
+      int count = 0;
+
+      for (final p in targetPages) {
+        final pageIndex = p - 1;
+        if (pageIndex < doc.pages.length) {
+          final page = doc.pages[pageIndex];
+          final pdfImage = await page.render(
+            fullWidth: page.width * 2.0,
+            fullHeight: page.height * 2.0,
+            backgroundColor: 0xFFFFFFFF,
+          );
+          if (pdfImage != null) {
+            final uiImg = await pdfImage.createImage();
+            pdfImage.dispose();
+            final byteData = await uiImg.toByteData(format: ui.ImageByteFormat.png);
+            uiImg.dispose();
+            if (byteData != null) {
+              final outFile = File('${exportFolder.path}${Platform.pathSeparator}page_$p.png');
+              await outFile.writeAsBytes(byteData.buffer.asUint8List(), flush: true);
+              count++;
+            }
+          }
+        }
+      }
+      await doc.dispose();
+      _showToast('Berhasil disimpan: $count gambar (${targetPages.join(", ")}) di folder ${exportFolder.path}');
+    } catch (e) {
+      _showToast('Gagal konversi ke Gambar: $e');
+    }
+  }
+
+  Future<void> _convertPdfToWord() async {
+    if (_filePath == null) return;
+
+    final baseName = (_fileName ?? 'Document').replaceAll(RegExp(r'\.pdf$', caseSensitive: false), '');
+    final Uri? saveUri = await FilePicker.saveFile(
+      dialogTitle: 'Save Word Document',
+      fileName: '$baseName.docx',
+      type: FileType.custom,
+      allowedExtensions: ['docx'],
+      bytes: Uint8List(0),
+    );
+
+    if (saveUri == null) return;
+    String finalPath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
+    if (!finalPath.toLowerCase().endsWith('.docx')) finalPath = '$finalPath.docx';
+
+    showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Perubahan Belum Disimpan'),
-        content: const Text(
-          'Anda memiliki tanda tangan atau editan yang belum disimpan ke file PDF. Yakin ingin keluar/menutup dokumen ini?',
+      barrierDismissible: false,
+      builder: (_) => const AlertDialog(
+        content: Row(
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(width: 20),
+            Expanded(child: Text('Mengonversi PDF ke Word dengan tata letak rapi...')),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Batal'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Keluar Tanpa Simpan'),
-          ),
-        ],
       ),
     );
 
-    return shouldClose ?? false;
+    try {
+      bool convertedWithNativeWord = false;
+
+      // 1. Prioritaskan mesin konversi Word Reflow bawaan Windows (Format 100% presisi)
+      if (Platform.isWindows) {
+        final escapedPdf = _filePath!.replaceAll("'", "''");
+        final escapedDocx = finalPath.replaceAll("'", "''");
+
+        final script = '''
+\$ErrorActionPreference = 'Stop'
+\$word = New-Object -ComObject Word.Application
+\$word.Visible = \$false
+\$doc = \$word.Documents.Open('$escapedPdf', \$false, \$true)
+\$doc.SaveAs2([ref] '$escapedDocx', [ref] 16)
+\$doc.Close(\$false)
+\$word.Quit()
+''';
+        final res = await Process.run('powershell', ['-NoProfile', '-NonInteractive', '-Command', script])
+            .timeout(const Duration(seconds: 40));
+
+        if (res.exitCode == 0 && await File(finalPath).exists()) {
+          convertedWithNativeWord = true;
+        }
+      }
+
+      // 2. Fallback: Rekonstruksi layout paragraf dan font jika Word COM tidak tersedia
+      if (!convertedWithNativeWord) {
+        final fileBytes = await File(_filePath!).readAsBytes();
+        final sfDoc = sf.PdfDocument(inputBytes: fileBytes);
+        final textExtractor = sf.PdfTextExtractor(sfDoc);
+        final String extractedText = textExtractor.extractText();
+        sfDoc.dispose();
+
+        final cleanText = extractedText
+            .replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F]'), '')
+            .replaceAll('\r\n', '\n')
+            .replaceAll('\r', '\n');
+
+        // Gabungkan baris-baris yang merupakan satu paragraf berkelanjutan agar rapi
+        final rawLines = cleanText.split('\n');
+        final List<String> paragraphs = [];
+        String currentParagraph = '';
+
+        for (final line in rawLines) {
+          final trimmed = line.trim();
+          if (trimmed.isEmpty) {
+            if (currentParagraph.isNotEmpty) {
+              paragraphs.add(currentParagraph);
+              currentParagraph = '';
+            }
+          } else {
+            if (currentParagraph.isEmpty) {
+              currentParagraph = trimmed;
+            } else {
+              // Jika baris sebelumnya tidak berakhiran tanda baca penutup, sambung kalimatnya
+              if (!currentParagraph.endsWith('.') && !currentParagraph.endsWith(':') && !currentParagraph.endsWith('?')) {
+                currentParagraph += ' $trimmed';
+              } else {
+                paragraphs.add(currentParagraph);
+                currentParagraph = trimmed;
+              }
+            }
+          }
+        }
+        if (currentParagraph.isNotEmpty) {
+          paragraphs.add(currentParagraph);
+        }
+
+        final StringBuffer xmlBody = StringBuffer();
+        for (final p in paragraphs) {
+          final escaped = p
+              .replaceAll('&', '&amp;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;')
+              .replaceAll('"', '&quot;')
+              .replaceAll("'", '&apos;');
+
+          xmlBody.write(
+            '<w:p>'
+            '<w:pPr><w:spacing w:after="160" w:line="260" w:lineRule="auto"/><w:jc w:val="both"/></w:pPr>'
+            '<w:r>'
+            '<w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr>'
+            '<w:t xml:space="preserve">$escaped</w:t>'
+            '</w:r>'
+            '</w:p>',
+          );
+        }
+
+        final documentXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            '<w:body>${xmlBody.toString()}</w:body>'
+            '</w:document>';
+
+        final contentTypesXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            '</Types>';
+
+        final relsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+            '</Relationships>';
+
+        final archive = Archive();
+        void addFile(String name, String content) {
+          final bytes = utf8.encode(content);
+          archive.addFile(ArchiveFile(name, bytes.length, bytes));
+        }
+
+        addFile('[Content_Types].xml', contentTypesXml);
+        addFile('_rels/.rels', relsXml);
+        addFile('word/document.xml', documentXml);
+
+        final zipData = ZipEncoder().encode(archive);
+        if (zipData != null) {
+          await File(finalPath).writeAsBytes(Uint8List.fromList(zipData), flush: true);
+        }
+      }
+
+      if (mounted) Navigator.pop(context);
+      _showToast('Berhasil diekspor ke Word: ${finalPath.split(Platform.pathSeparator).last}');
+    } catch (e) {
+      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+      _showToast('Gagal konversi ke Word: $e');
+    }
+  }
+
+  Future<void> _convertPdfToExcel() async {
+    if (_filePath == null) return;
+    try {
+      final fileBytes = await File(_filePath!).readAsBytes();
+      final sfDoc = sf.PdfDocument(inputBytes: fileBytes);
+      final textExtractor = sf.PdfTextExtractor(sfDoc);
+      final String extractedText = textExtractor.extractText();
+      sfDoc.dispose();
+
+      final StringBuffer csvBuffer = StringBuffer();
+      // UTF-8 BOM agar terbaca sempurna di Microsoft Excel
+      csvBuffer.write('\uFEFF');
+      final lines = extractedText.split('\n');
+      for (final line in lines) {
+        final trimmed = line.trim();
+        if (trimmed.isNotEmpty) {
+          // Deteksi pemisah spasi ganda/tab sebagai kolom tabel Excel
+          final cols = trimmed.split(RegExp(r'\s{2,}|\t'));
+          final formattedCols = cols.map((c) => '"${c.replaceAll('"', '""')}"').join(',');
+          csvBuffer.writeln(formattedCols);
+        }
+      }
+
+      final excelBytes = Uint8List.fromList(utf8.encode(csvBuffer.toString()));
+      final baseName = (_fileName ?? 'Document').replaceAll('.pdf', '');
+
+      final Uri? saveUri = await FilePicker.saveFile(
+        dialogTitle: 'Save Excel/Spreadsheet Document',
+        fileName: '$baseName.csv',
+        type: FileType.custom,
+        allowedExtensions: ['csv', 'xlsx'],
+        bytes: excelBytes,
+      );
+
+      if (saveUri != null) {
+        String finalPath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
+        if (!finalPath.toLowerCase().endsWith('.csv') && !finalPath.toLowerCase().endsWith('.xlsx')) {
+          finalPath = '$finalPath.csv';
+        }
+
+        await File(finalPath).writeAsBytes(excelBytes, flush: true);
+        _showToast('Berhasil diekspor ke format Excel (CSV): ${finalPath.split(Platform.pathSeparator).last}');
+      }
+    } catch (e) {
+      _showToast('Gagal konversi ke Excel: $e');
+    }
+  }
+
+  Future<bool> _onWillPop() async {
+    if (_filePath == null) {
+      return true;
+    }
+
+    if (_placedSignatures.isNotEmpty) {
+      final bool? shouldClose = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Unsaved Changes'),
+          content: const Text(
+            'You have signatures or edits that have not been saved to the PDF file. Are you sure you want to close this document?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Close Without Saving'),
+            ),
+          ],
+        ),
+      );
+
+      if (shouldClose != true) return false;
+    }
+
+    setState(() {
+      _filePath = null;
+      _fileName = null;
+      _placedSignatures.clear();
+      _selectedSigId = null;
+      _activeSignatureBytes = null;
+    });
+
+    return false;
   }
 
   void _openHistoryModal() {
@@ -334,7 +803,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         const Icon(Icons.history),
                         const SizedBox(width: 10),
                         Text(
-                          'Riwayat File Dibuka',
+                          'Recent Files History',
                           style: Theme.of(context)
                               .textTheme
                               .titleMedium
@@ -348,7 +817,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                               setModalState(() {});
                             },
                             icon: const Icon(Icons.delete_sweep_outlined, size: 18),
-                            label: const Text('Hapus Semua'),
+                            label: const Text('Clear All'),
                           ),
                         IconButton(
                           onPressed: () => Navigator.pop(ctx),
@@ -361,7 +830,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                       const Padding(
                         padding: EdgeInsets.symmetric(vertical: 32),
                         child: Center(
-                          child: Text('Belum ada riwayat dokumen yang dibuka.'),
+                          child: Text('No recent document history.'),
                         ),
                       )
                     else
@@ -376,7 +845,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                           itemBuilder: (context, index) {
                             final item = _recentFiles[index];
                             final path = item['path'] ?? '';
-                            final name = item['name'] ?? 'Dokumen.pdf';
+                            final name = item['name'] ?? 'Document.pdf';
                             final time = item['time'] ?? '';
                             return ListTile(
                               contentPadding: const EdgeInsets.symmetric(horizontal: 4),
@@ -402,7 +871,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                 style: const TextStyle(fontSize: 12),
                               ),
                               trailing: IconButton(
-                                tooltip: 'Hapus dari riwayat',
+                                tooltip: 'Remove from history',
                                 icon: const Icon(Icons.close, size: 18),
                                 onPressed: () async {
                                   await _removeRecentFile(path);
@@ -459,24 +928,72 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
-  Future<void> _pickPdfFile() async {
-    try {
-      final result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['pdf'],
-      );
-
-      if (result != null && result.isNotEmpty && result.single.path != null) {
-        if (_filePath != null && _placedSignatures.isNotEmpty) {
-          bool canProceed = await _onWillPop();
-          if (!canProceed) return;
-        }
-        _openPdfFromPath(result.single.path!);
-      }
-    } catch (e) {
-      debugPrint('Gagal memilih file: $e');
+  Future<void> _createNewPdf() async {
+  try {
+    if (_filePath != null && _placedSignatures.isNotEmpty) {
+      bool canProceed = await _onWillPop();
+      if (!canProceed) return;
     }
+
+    // Membuat dokumen PDF baru kosong dengan 1 halaman default
+    final newDoc = sf.PdfDocument();
+    newDoc.pageSettings.margins.all = 0;
+    newDoc.pages.add(); // Minimal 1 halaman kosong
+
+    final bytes = Uint8List.fromList(await newDoc.save());
+    newDoc.dispose();
+
+    final tempWorkFile = File('${Directory.systemTemp.path}${Platform.pathSeparator}new_document_${DateTime.now().millisecondsSinceEpoch}.pdf');
+    await tempWorkFile.writeAsBytes(bytes, flush: true);
+
+    _openPdfFromPath(tempWorkFile.path);
+      setState(() {
+        _fileName = 'MyDocument.pdf';
+        _originalFilePath = null; // Menandakan file baru belum punya path asli
+      });
+    _showToast('New PDF created successfully. You can now edit or save it.');
+  } catch (e) {
+    _showToast('Failed to create PDF: $e');
   }
+}
+
+
+
+Future<void> _pickPdfFile() async {
+  try {
+    final dynamic pickResult = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+    );
+
+    if (pickResult == null) return;
+
+    String? selectedPath;
+    if (pickResult is List && pickResult.isNotEmpty) {
+      selectedPath = pickResult.first?.path;
+    } else {
+      try {
+        final files = pickResult.files;
+        if (files != null && files.isNotEmpty) {
+          selectedPath = files.first.path;
+        }
+      } catch (_) {
+        selectedPath = pickResult.paths?.firstOrNull;
+      }
+    }
+
+    if (selectedPath == null || selectedPath.isEmpty) return;
+
+    if (_filePath != null && _placedSignatures.isNotEmpty) {
+      bool canProceed = await _onWillPop();
+      if (!canProceed) return;
+    }
+
+    _openPdfFromPath(selectedPath);
+  } catch (e, stack) {
+    debugPrint('Failed to pick file: $e\n$stack');
+  }
+}
 
   Future<Uint8List> _resizeImageBytes(Uint8List inputBytes, double scale) async {
     try {
@@ -591,33 +1108,33 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 : '${estimatedKb.toStringAsFixed(0)} KB';
 
             return AlertDialog(
-              title: const Text('Opsi Simpan & Kompresi Dokumen PDF'),
+              title: const Text('Save Options & PDF Compression'),
               content: SizedBox(
                 width: 400,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text('Pilih metode penyimpanan file PDF:'),
+                    const Text('Select PDF save method:'),
                     const SizedBox(height: 16),
                     RadioListTile<bool>(
-                      title: const Text('Ukuran Asli (Kualitas Penuh)'),
+                      title: const Text('Original Size (Full Quality)'),
                       subtitle: Text(
-                          'Estimasi: ${originalSizeKb > 1024 ? "${(originalSizeKb / 1024).toStringAsFixed(2)} MB" : "${originalSizeKb.toStringAsFixed(0)} KB"}'),
+                          'Estimated: ${originalSizeKb > 1024 ? "${(originalSizeKb / 1024).toStringAsFixed(2)} MB" : "${originalSizeKb.toStringAsFixed(0)} KB"}'),
                       value: true,
                       groupValue: useOriginalSize,
                       onChanged: (val) => setStateModal(() => useOriginalSize = val!),
                     ),
                     RadioListTile<bool>(
-                      title: const Text('Perkecil Keseluruhan File PDF'),
-                      subtitle: const Text('Kompres resolusi seluruh halaman dokumen & tanda tangan'),
+                      title: const Text('Shrink Entire PDF'),
+                      subtitle: const Text('Compress resolution of all document pages & signatures'),
                       value: false,
                       groupValue: useOriginalSize,
                       onChanged: (val) => setStateModal(() => useOriginalSize = val!),
                     ),
                     if (!useOriginalSize) ...[
                       const SizedBox(height: 10),
-                      Text('Skala Kompresi Dokumen: ${(scaleFactor * 100).toInt()}%'),
+                      Text('Compression Scale: ${(scaleFactor * 100).toInt()}%'),
                       Slider(
                         value: scaleFactor.clamp(0.3, 0.9),
                         min: 0.3,
@@ -640,7 +1157,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                           const SizedBox(width: 10),
                           Expanded(
                             child: Text(
-                              'Perkiraan Ukuran File Output: $sizeText',
+                              'Estimated Output Size: $sizeText',
                               style: const TextStyle(fontWeight: FontWeight.bold),
                             ),
                           ),
@@ -653,12 +1170,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
               actions: [
                 TextButton(
                   onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('Batal'),
+                  child: const Text('Cancel'),
                 ),
                 FilledButton.icon(
                   onPressed: () => Navigator.pop(ctx, true),
                   icon: const Icon(Icons.save_alt, size: 18),
-                  label: const Text('Simpan File'),
+                  label: const Text('Save File'),
                 ),
               ],
             );
@@ -677,7 +1194,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           children: [
             CircularProgressIndicator(),
             SizedBox(width: 20),
-            Expanded(child: Text('Memproses & mengompresi dokumen PDF...')),
+            Expanded(child: Text('Processing & compressing PDF document...')),
           ],
         ),
       ),
@@ -785,44 +1302,75 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
       if (mounted) Navigator.pop(context);
 
-      String? targetSavePath;
-      if (saveAs) {
+      final savedSizeKb = signedBytes.length / 1024;
+      final savedSizeText = savedSizeKb > 1024
+          ? '${(savedSizeKb / 1024).toStringAsFixed(2)} MB'
+          : '${savedSizeKb.toStringAsFixed(0)} KB';
+
+      // Jika file baru (Create PDF) atau memilih Save As
+      if (saveAs || _originalFilePath == null) {
+        // Jika file baru, gunakan nama bersih atau biarkan kosong/default yang bagus tanpa kata 'Untitled' kaku
+        final defaultName = _originalFilePath == null ? 'MyDocument.pdf' : 'Signed_${_fileName ?? "document.pdf"}';
         final Uri? saveUri = await FilePicker.saveFile(
-          dialogTitle: 'Simpan PDF Sebagai (Save As)',
-          fileName: 'Signed_${_fileName ?? "document.pdf"}',
+          dialogTitle: 'Save PDF As',
+          fileName: defaultName,
           type: FileType.custom,
           allowedExtensions: ['pdf'],
           bytes: signedBytes,
         );
 
-        if (saveUri != null) {
-          targetSavePath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
-          if (!targetSavePath.toLowerCase().endsWith('.pdf')) {
-            targetSavePath = '$targetSavePath.pdf';
+        if (saveUri == null) return;
+
+        if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+          String finalPath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
+          if (!finalPath.toLowerCase().endsWith('.pdf')) {
+            finalPath = '$finalPath.pdf';
+          }
+          await File(finalPath).writeAsBytes(signedBytes, flush: true);
+
+          if (mounted) {
+            _showToast(
+              'Successfully saved ($savedSizeText): ${finalPath.split(Platform.pathSeparator).last}',
+              actionLabel: 'Open File',
+              onAction: () {
+                setState(() {
+                  _filePath = finalPath;
+                  _fileName = finalPath.split(Platform.pathSeparator).last;
+                  _placedSignatures.clear();
+                  _selectedSigId = null;
+                });
+              },
+            );
+          }
+        } else {
+          // Setelah file baru disimpan, langsung set acuan path baru dan buka file tersebut otomatis
+          final tempDir = await getTemporaryDirectory();
+          final saveFileName = _originalFilePath == null ? (_fileName ?? 'Untitled.pdf') : 'Signed_${_fileName ?? "document.pdf"}';
+          final tempSavedFile = File('${tempDir.path}${Platform.pathSeparator}$saveFileName');
+          await tempSavedFile.writeAsBytes(signedBytes, flush: true);
+
+          if (mounted) {
+            setState(() {
+              _originalFilePath = tempSavedFile.path;
+              _fileName = saveFileName;
+              _placedSignatures.clear();
+              _selectedSigId = null;
+            });
+            _openPdfFromPath(tempSavedFile.path);
+            _showToast('Successfully saved and opened ($savedSizeText)');
           }
         }
       } else {
-        targetSavePath = _originalFilePath ?? _filePath;
-      }
-
-      if (targetSavePath != null) {
-        final String finalPath = targetSavePath;
+        final String finalPath = _originalFilePath ?? _filePath!;
         final int lastPage = _currentPage;
 
-        if (!saveAs) {
-          setState(() => _filePath = null);
-          await Future.delayed(const Duration(milliseconds: 150));
-        }
+        setState(() => _filePath = null);
+        await Future.delayed(const Duration(milliseconds: 150));
 
         final outFile = File(finalPath);
         await outFile.writeAsBytes(signedBytes, flush: true);
 
-        final savedSizeKb = signedBytes.length / 1024;
-        final savedSizeText = savedSizeKb > 1024
-            ? '${(savedSizeKb / 1024).toStringAsFixed(2)} MB'
-            : '${savedSizeKb.toStringAsFixed(0)} KB';
-
-        if (!saveAs && mounted) {
+        if (mounted) {
           setState(() {
             _filePath = finalPath;
             _placedSignatures.clear();
@@ -831,30 +1379,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             Future.delayed(const Duration(milliseconds: 200), () => _goToPage(lastPage));
           });
-        }
-
-        if (mounted) {
-          _showToast(
-            saveAs
-                ? 'Berhasil disimpan ($savedSizeText): ${finalPath.split(Platform.pathSeparator).last}'
-                : 'File berhasil diperbarui ($savedSizeText)',
-            actionLabel: saveAs ? 'Buka File' : null,
-            onAction: saveAs
-                ? () {
-                    setState(() {
-                      _filePath = finalPath;
-                      _fileName = finalPath.split(Platform.pathSeparator).last;
-                      _placedSignatures.clear();
-                      _selectedSigId = null;
-                    });
-                  }
-                : null,
-          );
+          _showToast('File successfully updated ($savedSizeText)');
         }
       }
     } catch (e) {
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
-      _showToast('Gagal menyimpan PDF: $e');
+      _showToast('Failed to save PDF: $e');
     }
   }
 
@@ -880,7 +1410,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         const Icon(Icons.draw_outlined),
                         const SizedBox(width: 10),
                         Text(
-                          'Koleksi Tanda Tangan',
+                          'Signature Bank',
                           style: Theme.of(context)
                               .textTheme
                               .titleLarge
@@ -908,7 +1438,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                             }
                           },
                           icon: const Icon(Icons.gesture),
-                          label: const Text('Buat Coretan Baru'),
+                          label: const Text('Draw New'),
                         ),
                         const SizedBox(width: 12),
                         OutlinedButton.icon(
@@ -917,7 +1447,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                               type: FileType.custom,
                               allowedExtensions: ['png'],
                             );
-                            if (res != null && res.isNotEmpty && res.single.path != null) {
+                            if (res.isNotEmpty && res.single.path != null) {
                               final bytes = await File(res.single.path!).readAsBytes();
                               await _saveSignatureToBank(bytes);
                               setModalState(() {});
@@ -930,7 +1460,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     ),
                     const SizedBox(height: 20),
                     Text(
-                      'Pilih tanda tangan untuk mulai menempelkan ke halaman PDF:',
+                      'Select a signature to place onto the PDF page:',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                             color: Theme.of(context).colorScheme.outline,
                           ),
@@ -948,7 +1478,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                           children: [
                             Icon(Icons.inbox_outlined, size: 40, color: Colors.grey),
                             SizedBox(height: 8),
-                            Text('Belum ada tanda tangan tersimpan'),
+                            Text('No saved signatures'),
                           ],
                         ),
                       )
@@ -967,7 +1497,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                               onTap: () {
                                 Navigator.pop(ctx);
                                 setState(() => _activeSignatureBytes = bytes);
-                                _showToast('Mode Tempel Aktif: Klik pada halaman PDF untuk meletakkan tanda tangan.');
+                                _showToast('Stamp Mode Active: Tap on the PDF page to place signature.');
                               },
                               child: Container(
                                 width: 170,
@@ -992,7 +1522,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                       child: IconButton.filledTonal(
                                         visualDensity: VisualDensity.compact,
                                         iconSize: 16,
-                                        tooltip: 'Hapus dari koleksi',
+                                        tooltip: 'Delete signature',
                                         icon: const Icon(Icons.delete_outline),
                                         onPressed: () async {
                                           await _deleteSavedSignature(file);
@@ -1072,9 +1602,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       }
       final raw = utf8.decode(bytes, allowMalformed: true);
       final clean = raw.replaceAll(RegExp(r'[^\x20-\x7E\n\r\t]'), ' ').replaceAll(RegExp(r' {3,}'), '\n');
-      return clean.trim().isEmpty ? 'Dokumen Word' : clean.trim();
+      return clean.trim().isEmpty ? 'Word Document' : clean.trim();
     } catch (e) {
-      return 'Gagal mengekstrak teks: $e';
+      return 'Failed to extract text: $e';
     }
   }
 
@@ -1121,7 +1651,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                 children: [
                   Icon(Icons.post_add_outlined),
                   SizedBox(width: 10),
-                  Expanded(child: Text('Tambah / Sisipkan Halaman')),
+                  Expanded(child: Text('Insert / Add Page')),
                 ],
               ),
               content: SizedBox(
@@ -1131,18 +1661,18 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                     mainAxisSize: MainAxisSize.min,
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text('Pilih posisi penyisipan halaman baru:', style: TextStyle(fontWeight: FontWeight.w600)),
+                      const Text('Select insertion position:', style: TextStyle(fontWeight: FontWeight.w600)),
                       const SizedBox(height: 8),
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Di Awal Dokumen'),
+                        title: const Text('At Beginning of Document'),
                         value: 0,
                         groupValue: insertPosOption,
                         onChanged: (val) => setModalState(() => insertPosOption = val!),
                       ),
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Di Antara / Setelah Halaman'),
+                        title: const Text('After Specific Page'),
                         value: 1,
                         groupValue: insertPosOption,
                         onChanged: (val) => setModalState(() => insertPosOption = val!),
@@ -1155,14 +1685,14 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                             keyboardType: TextInputType.number,
                             decoration: InputDecoration(
                               isDense: true,
-                              labelText: 'Sisipkan setelah nomor halaman (1 - $_totalPages)',
+                              labelText: 'Insert after page (1 - $_totalPages)',
                               border: const OutlineInputBorder(),
                             ),
                           ),
                         ),
                       RadioListTile<int>(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Di Akhir Dokumen'),
+                        title: const Text('At End of Document'),
                         value: 2,
                         groupValue: insertPosOption,
                         onChanged: (val) => setModalState(() => insertPosOption = val!),
@@ -1174,12 +1704,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
               actions: [
                 TextButton(
                   onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('Batal'),
+                  child: const Text('Cancel'),
                 ),
                 FilledButton.icon(
                   onPressed: () => Navigator.pop(ctx, true),
                   icon: const Icon(Icons.folder_open, size: 18),
-                  label: const Text('Pilih File...'),
+                  label: const Text('Choose File...'),
                 ),
               ],
             );
@@ -1200,12 +1730,12 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
 
     final pickResult = await FilePicker.pickFiles(
-      dialogTitle: 'Pilih File PDF, Gambar, atau Word',
+      dialogTitle: 'Select PDF, Image, or Word File',
       type: FileType.custom,
       allowedExtensions: ['pdf', 'png', 'jpg', 'jpeg', 'webp', 'docx', 'doc'],
     );
 
-    if (pickResult == null || pickResult.isEmpty || pickResult.single.path == null) return;
+    if (pickResult.isEmpty || pickResult.single.path == null) return;
 
     final pickedPath = pickResult.single.path!;
     final ext = pickedPath.split('.').last.toLowerCase();
@@ -1219,7 +1749,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
           children: [
             CircularProgressIndicator(),
             SizedBox(width: 20),
-            Expanded(child: Text('Menyisipkan halaman ke dalam dokumen...')),
+            Expanded(child: Text('Inserting page into document...')),
           ],
         ),
       ),
@@ -1270,7 +1800,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         }
       }
 
-      if (insertPdfBytes == null) throw Exception('Format file tidak dapat diproses.');
+      if (insertPdfBytes == null) throw Exception('File format cannot be processed.');
 
       final originalBytes = await File(_filePath!).readAsBytes();
       final baseDoc = sf.PdfDocument(inputBytes: originalBytes);
@@ -1326,10 +1856,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         Future.delayed(const Duration(milliseconds: 250), () => _goToPage(insertAfterPage + 1));
       });
 
-      _showToast('Berhasil menyisipkan $addedCount halaman');
+      _showToast('Successfully inserted $addedCount page(s)');
     } catch (e) {
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
-      _showToast('Gagal menyisipkan halaman: $e');
+      _showToast('Failed to insert page: $e');
     }
   }
 
@@ -1360,39 +1890,6 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _showToast(toastMsg);
   }
 
-  Future<void> _rotatePdfPages({required bool clockwise, bool allPages = false}) async {
-    if (_filePath == null) return;
-    try {
-      final originalBytes = await File(_filePath!).readAsBytes();
-      final doc = sf.PdfDocument(inputBytes: originalBytes);
-      doc.fileStructure.incrementalUpdate = false;
-
-      final angles = [
-        sf.PdfPageRotateAngle.rotateAngle0,
-        sf.PdfPageRotateAngle.rotateAngle90,
-        sf.PdfPageRotateAngle.rotateAngle180,
-        sf.PdfPageRotateAngle.rotateAngle270,
-      ];
-
-      final startIdx = allPages ? 0 : (_currentPage - 1);
-      final endIdx = allPages ? (doc.pages.count - 1) : (_currentPage - 1);
-
-      for (int i = startIdx; i <= endIdx; i++) {
-        if (i >= 0 && i < doc.pages.count) {
-          final page = doc.pages[i];
-          final currentIdx = angles.indexOf(page.rotation);
-          final nextIdx = clockwise ? (currentIdx + 1) % 4 : (currentIdx + 3) % 4;
-          page.rotation = angles[nextIdx];
-        }
-      }
-
-      final saved = Uint8List.fromList(await doc.save());
-      doc.dispose();
-      await _applyModifiedPdfBytes(saved, _currentPage, allPages ? 'Semua halaman diputar' : 'Halaman diputar');
-    } catch (e) {
-      _showToast('Gagal memutar halaman: $e');
-    }
-  }
 
   Future<void> _insertBlankPage() async {
     if (_filePath == null) return;
@@ -1427,9 +1924,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Halaman kosong ditambahkan');
+      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Blank page added');
     } catch (e) {
-      _showToast('Gagal menambah halaman: $e');
+      _showToast('Failed to add page: $e');
     }
   }
 
@@ -1454,30 +1951,30 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Halaman diduplikat');
+      await _applyModifiedPdfBytes(saved, _currentPage + 1, 'Page duplicated');
     } catch (e) {
-      _showToast('Gagal menduplikat: $e');
+      _showToast('Failed to duplicate: $e');
     }
   }
 
   Future<void> _deleteCurrentPage() async {
     if (_filePath == null) return;
     if (_totalPages <= 1) {
-      _showToast('Tidak bisa menghapus satu-satunya halaman.');
+      _showToast('Cannot delete the only remaining page.');
       return;
     }
 
     final bool? confirm = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Hapus Halaman'),
-        content: Text('Yakin ingin menghapus Halaman $_currentPage?'),
+        title: const Text('Delete Page'),
+        content: Text('Are you sure you want to delete Page $_currentPage?'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Hapus'),
+            child: const Text('Delete'),
           ),
         ],
       ),
@@ -1504,9 +2001,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(saved, _currentPage > 1 ? _currentPage - 1 : 1, 'Halaman dihapus');
+      await _applyModifiedPdfBytes(saved, _currentPage > 1 ? _currentPage - 1 : 1, 'Page deleted');
     } catch (e) {
-      _showToast('Gagal menghapus: $e');
+      _showToast('Failed to delete: $e');
     }
   }
 
@@ -1517,16 +2014,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     final int? targetPage = await showDialog<int>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text('Pindahkan Halaman $_currentPage'),
+        title: Text('Move Page $_currentPage'),
         content: TextField(
           controller: targetCtrl,
           keyboardType: TextInputType.number,
           autofocus: true,
-          decoration: const InputDecoration(labelText: 'Pindah ke urutan halaman', border: OutlineInputBorder()),
+          decoration: const InputDecoration(labelText: 'Move to page index', border: OutlineInputBorder()),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Batal')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, int.tryParse(targetCtrl.text)), child: const Text('Pindahkan')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, int.tryParse(targetCtrl.text)), child: const Text('Move')),
         ],
       ),
     );
@@ -1556,9 +2053,9 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       final saved = Uint8List.fromList(await outDoc.save());
       baseDoc.dispose();
       outDoc.dispose();
-      await _applyModifiedPdfBytes(saved, newPos, 'Halaman dipindahkan');
+      await _applyModifiedPdfBytes(saved, newPos, 'Page moved');
     } catch (e) {
-      _showToast('Gagal memindahkan: $e');
+      _showToast('Failed to move: $e');
     }
   }
 
@@ -1576,91 +2073,24 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       outDoc.dispose();
 
       final Uri? saveUri = await FilePicker.saveFile(
-        dialogTitle: 'Ekstrak Halaman Sebagai PDF',
-        fileName: 'Hal_${_currentPage}_${_fileName ?? "document.pdf"}',
+        dialogTitle: 'Extract Page As PDF',
+        fileName: 'Page_${_currentPage}_${_fileName ?? "document.pdf"}',
         type: FileType.custom,
         allowedExtensions: ['pdf'],
         bytes: extractedBytes,
       );
 
       if (saveUri != null) {
-        String savePath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
-        if (!savePath.toLowerCase().endsWith('.pdf')) savePath = '$savePath.pdf';
-        await File(savePath).writeAsBytes(extractedBytes, flush: true);
-        _showToast('Halaman berhasil diekstrak!');
+        if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
+          String savePath = saveUri.scheme == 'file' ? saveUri.toFilePath() : saveUri.toString();
+          if (!savePath.toLowerCase().endsWith('.pdf')) savePath = '$savePath.pdf';
+          await File(savePath).writeAsBytes(extractedBytes, flush: true);
+        }
+        _showToast('Page successfully extracted!');
       }
     } catch (e) {
-      _showToast('Gagal mengekstrak: $e');
+      _showToast('Failed to extract: $e');
     }
-  }
-
-  void _openPageManagerModal() {
-    if (_filePath == null || _totalPages <= 0) return;
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (ctx) {
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-            child: SingleChildScrollView(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      const Icon(Icons.layers_outlined),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Text(
-                          'Kelola Halaman (Hal $_currentPage dari $_totalPages)',
-                          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-                        ),
-                      ),
-                      IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close)),
-                    ],
-                  ),
-                  const Divider(),
-                  ListTile(
-                    leading: const Icon(Icons.post_add_outlined, color: Colors.indigo),
-                    title: const Text('Sisipkan File (PDF / Gambar / Word)'),
-                    onTap: () { Navigator.pop(ctx); _openInsertPageModal(); },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.note_add_outlined, color: Colors.teal),
-                    title: const Text('Tambah Halaman Kosong'),
-                    onTap: () { Navigator.pop(ctx); _insertBlankPage(); },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.copy_all_outlined, color: Colors.blue),
-                    title: const Text('Duplikat Halaman Ini'),
-                    onTap: () { Navigator.pop(ctx); _duplicateCurrentPage(); },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.low_priority_outlined, color: Colors.orange),
-                    title: const Text('Pindahkan Urutan Halaman...'),
-                    onTap: () { Navigator.pop(ctx); _moveCurrentPageDialog(); },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.ios_share_outlined, color: Colors.deepPurple),
-                    title: const Text('Ekstrak Halaman ke PDF Baru'),
-                    onTap: () { Navigator.pop(ctx); _extractCurrentPageToPdf(); },
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.delete_forever_outlined, color: Colors.redAccent),
-                    title: const Text('Hapus Halaman Ini', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600)),
-                    onTap: () { Navigator.pop(ctx); _deleteCurrentPage(); },
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
   }
 
   @override
@@ -1669,71 +2099,271 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
-        final bool shouldPop = await _onWillPop();
-        if (shouldPop && context.mounted) {
-          Navigator.of(context).pop();
+        final bool shouldQuitApp = await _onWillPop();
+        if (shouldQuitApp) {
+          if (Platform.isAndroid || Platform.isIOS) {
+            await SystemNavigator.pop();
+            exit(0);
+          } else {
+            exit(0);
+          }
         }
       },
       child: Scaffold(
         appBar: AppBar(
-          title: Text(_fileName ?? 'Fajar PDF Reader', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18)),
+          title: _isSearching
+              ? TextField(
+                  controller: _searchController,
+                  autofocus: true,
+                  style: const TextStyle(fontSize: 16),
+                  decoration: const InputDecoration(
+                    hintText: 'Search text in document...',
+                    border: InputBorder.none,
+                  ),
+                  onChanged: (query) {
+                    if (_textSearcher == null) return;
+                    if (query.trim().isNotEmpty) {
+                      _textSearcher!.startTextSearch(query.trim());
+                    } else {
+                      _textSearcher!.resetTextSearch();
+                    }
+                  },
+                )
+              : Text(_fileName ?? 'Fajar PDF Reader', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18)),
           centerTitle: false,
           actions: [
-            IconButton(
-              tooltip: 'Buka File PDF',
-              icon: const Icon(Icons.folder_open_outlined),
-              onPressed: _pickPdfFile,
-            ),
-            IconButton(
-              tooltip: 'Riwayat File Dibuka',
-              icon: const Icon(Icons.history),
-              onPressed: _openHistoryModal,
-            ),
             if (_filePath != null) ...[
-              IconButton(
-                tooltip: 'Bagikan Dokumen (Share)',
-                icon: const Icon(Icons.share_outlined),
-                onPressed: _shareCurrentPdf,
-              ),
-              IconButton(
-                tooltip: 'Kelola Halaman',
-                icon: const Icon(Icons.layers_outlined),
-                onPressed: _openPageManagerModal,
-              ),
-              IconButton(
-                tooltip: 'Kelola Tanda Tangan',
-                icon: const Icon(Icons.draw_outlined),
-                onPressed: _openSignatureManager,
-              ),
-              IconButton(
-                tooltip: 'Save (Simpan)',
-                onPressed: () => _exportSignedPdf(saveAs: false),
-                icon: const Icon(Icons.save_outlined),
-              ),
-              IconButton(
-                tooltip: 'Save As (Simpan Sebagai)',
-                onPressed: () => _exportSignedPdf(saveAs: true),
-                icon: const Icon(Icons.save_as_outlined),
-              ),
-            ],
-            PopupMenuButton<ThemeMode>(
-              tooltip: 'Tema Tampilan',
-              icon: Icon(
-                widget.currentThemeMode == ThemeMode.dark
-                    ? Icons.dark_mode_outlined
-                    : widget.currentThemeMode == ThemeMode.light
-                        ? Icons.light_mode_outlined
-                        : Icons.brightness_auto_outlined,
-              ),
-              onSelected: widget.onThemeChanged,
-              itemBuilder: (context) => [
-                const CheckedPopupMenuItem(value: ThemeMode.system, child: Text('Ikuti Sistem')),
-                const CheckedPopupMenuItem(value: ThemeMode.light, child: Text('Mode Terang')),
-                const CheckedPopupMenuItem(value: ThemeMode.dark, child: Text('Mode Gelap')),
+              if (_isSearching && _textSearcher != null) ...[
+                ListenableBuilder(
+                  listenable: _textSearcher!,
+                  builder: (context, _) {
+                    final matches = _textSearcher!.matches;
+                    final currentIdx = _textSearcher!.currentIndex;
+                    final total = matches.length;
+                    return Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          total > 0 ? '${(currentIdx ?? 0) + 1}/$total' : '0/0',
+                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                        ),
+                        IconButton(
+                          tooltip: 'Previous match',
+                          icon: const Icon(Icons.keyboard_arrow_up),
+                          onPressed: total > 0 ? () => _textSearcher!.goToPrevMatch() : null,
+                        ),
+                        IconButton(
+                          tooltip: 'Next match',
+                          icon: const Icon(Icons.keyboard_arrow_down),
+                          onPressed: total > 0 ? () => _textSearcher!.goToNextMatch() : null,
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                IconButton(
+                  tooltip: 'Close search',
+                  icon: const Icon(Icons.close),
+                  onPressed: () {
+                    setState(() {
+                      _isSearching = false;
+                      _searchController.clear();
+                      _textSearcher?.resetTextSearch();
+                    });
+                  },
+                ),
+              ] else ...[
+                IconButton(
+                  tooltip: 'Search in PDF',
+                  icon: const Icon(Icons.search),
+                  onPressed: () => setState(() => _isSearching = true),
+                ),
               ],
-            ),
+            ],
+            if (_filePath != null)
+              IconButton(
+                tooltip: 'Print Document',
+                icon: const Icon(Icons.print_outlined),
+                onPressed: _printCurrentPdf,
+              ),
             const SizedBox(width: 4),
           ],
+        ),
+        // MENU HAMBURGER (DRAWER) DENGAN LABEL BAHASA INGGRIS
+        drawer: Drawer(
+          child: ListView(
+            padding: EdgeInsets.zero,
+            children: [
+              DrawerHeader(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.primaryContainer,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    Icon(Icons.picture_as_pdf, size: 40, color: Theme.of(context).colorScheme.primary),
+                    const SizedBox(height: 10),
+                    Text(
+                      'Fajar PDF Reader',
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                        color: Theme.of(context).colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _fileName ?? 'No document open',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onPrimaryContainer.withValues(alpha: 0.8),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              ListTile(
+              leading: const Icon(Icons.note_add_outlined),
+              title: const Text('Create PDF'),
+              onTap: () {
+                Navigator.pop(context);
+                _createNewPdf();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('Open File'),
+              onTap: () {
+                Navigator.pop(context);
+                _pickPdfFile();
+              },
+            ),
+              ListTile(
+                leading: const Icon(Icons.history),
+                title: const Text('History'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _openHistoryModal();
+                },
+              ),
+              if (_filePath != null) ...[
+                const Divider(),
+                ListTile(
+                  leading: const Icon(Icons.share_outlined),
+                  title: const Text('Share Document'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _shareCurrentPdf();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.print_outlined),
+                  title: const Text('Print Document'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _printCurrentPdf();
+                  },
+                ),
+                ExpansionTile(
+                  leading: const Icon(Icons.transform_outlined),
+                  title: const Text('Convert'),
+                  childrenPadding: const EdgeInsets.only(left: 16),
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.image_outlined, color: Colors.blueAccent),
+                      title: const Text('Convert to Image (PNG)'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _convertPdfToImages();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.description_outlined, color: Colors.indigoAccent),
+                      title: const Text('Convert to Document Word (.docx)'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _convertPdfToWord();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.table_chart_outlined, color: Colors.teal),
+                      title: const Text('Convert to Excel (.csv / .xlsx)'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _convertPdfToExcel();
+                      },
+                    ),
+                  ],
+                ),
+                ListTile(
+                  leading: const Icon(Icons.layers_outlined),
+                  title: const Text('Manage Pages'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _openPageManagerModal();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.draw_outlined),
+                  title: const Text('Signature Bank'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _openSignatureManager();
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.save_outlined),
+                  title: const Text('Save'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _exportSignedPdf(saveAs: false);
+                  },
+                ),
+                ListTile(
+                  leading: const Icon(Icons.save_as_outlined),
+                  title: const Text('Save As'),
+                  onTap: () {
+                    Navigator.pop(context);
+                    _exportSignedPdf(saveAs: true);
+                  },
+                ),
+              ],
+              const Divider(),
+              ExpansionTile(
+                leading: const Icon(Icons.brightness_6_outlined),
+                title: const Text('Theme Mode'),
+                children: [
+                  RadioListTile<ThemeMode>(
+                    title: const Text('System'),
+                    value: ThemeMode.system,
+                    groupValue: widget.currentThemeMode,
+                    onChanged: (val) {
+                      if (val != null) widget.onThemeChanged(val);
+                    },
+                  ),
+                  RadioListTile<ThemeMode>(
+                    title: const Text('Light'),
+                    value: ThemeMode.light,
+                    groupValue: widget.currentThemeMode,
+                    onChanged: (val) {
+                      if (val != null) widget.onThemeChanged(val);
+                    },
+                  ),
+                  RadioListTile<ThemeMode>(
+                    title: const Text('Dark'),
+                    value: ThemeMode.dark,
+                    groupValue: widget.currentThemeMode,
+                    onChanged: (val) {
+                      if (val != null) widget.onThemeChanged(val);
+                    },
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
         body: Stack(
           children: [
@@ -1766,10 +2396,10 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                       child: Icon(Icons.picture_as_pdf_outlined, size: 44, color: Theme.of(context).colorScheme.primary),
                                     ),
                                     const SizedBox(height: 16),
-                                    Text('Belum Ada Dokumen', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
+                                    Text('No Document Open', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold)),
                                     const SizedBox(height: 6),
                                     Text(
-                                      'Buka file PDF untuk membaca, mengatur halaman, atau membubuhkan tanda tangan digital.',
+                                      'Open a PDF file to read, manage pages, or apply digital signatures.',
                                       textAlign: TextAlign.center,
                                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.outline),
                                     ),
@@ -1779,7 +2409,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                       child: FilledButton.icon(
                                         onPressed: _pickPdfFile,
                                         icon: const Icon(Icons.file_open_outlined),
-                                        label: const Text('Pilih File PDF'),
+                                        label: const Text('Open PDF File'),
                                       ),
                                     ),
                                   ],
@@ -1797,12 +2427,16 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                       _filePath!,
                       controller: _pdfController,
                       params: PdfViewerParams(
+                        pagePaintCallbacks: [
+                          if (_textSearcher != null) _textSearcher!.pageTextMatchPaintCallback,
+                        ],
                         maxScale: 5.0,
                         minScale: 0.5,
                         onViewerReady: (document, controller) {
                           setState(() {
                             _totalPages = document.pages.length;
                             _currentPage = controller.pageNumber ?? 1;
+                            _textSearcher = PdfTextSearcher(controller);
                           });
                         },
                         onPageChanged: (pageNumber) {
@@ -1878,7 +2512,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                     child: Chip(
                                       backgroundColor: Theme.of(context).colorScheme.primary,
                                       label: Text(
-                                        'Ketuk untuk menempelkan Tanda Tangan (Hal ${page.pageNumber})',
+                                        'Tap to place signature (Page ${page.pageNumber})',
                                         style: TextStyle(color: Theme.of(context).colorScheme.onPrimary),
                                       ),
                                     ),
@@ -1966,6 +2600,101 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                                               ),
                                             ),
                                           ),
+                                          Align(
+                                            alignment: Alignment.centerRight,
+                                            child: Transform.translate(
+                                              offset: const Offset(6, 0),
+                                              child: MouseRegion(
+                                                cursor: SystemMouseCursors.resizeLeftRight,
+                                                child: GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onPanUpdate: (details) {
+                                                    setState(() {
+                                                      final deltaW = details.delta.dx / pageRect.width;
+                                                      sig.relWidth = (sig.relWidth + deltaW).clamp(0.04, 1.0 - sig.relX);
+                                                    });
+                                                  },
+                                                  child: Padding(
+                                                    padding: const EdgeInsets.all(6.0),
+                                                    child: Container(
+                                                      width: 12,
+                                                      height: 12,
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.blueAccent,
+                                                        shape: BoxShape.circle,
+                                                        border: Border.all(color: Colors.white, width: 1.5),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          Align(
+                                            alignment: Alignment.bottomCenter,
+                                            child: Transform.translate(
+                                              offset: const Offset(0, 6),
+                                              child: MouseRegion(
+                                                cursor: SystemMouseCursors.resizeUpDown,
+                                                child: GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onPanUpdate: (details) {
+                                                    setState(() {
+                                                      final deltaH = details.delta.dy / pageRect.height;
+                                                      sig.relHeight = (sig.relHeight + deltaH).clamp(0.02, 1.0 - sig.relY);
+                                                    });
+                                                  },
+                                                  child: Padding(
+                                                    padding: const EdgeInsets.all(6.0),
+                                                    child: Container(
+                                                      width: 12,
+                                                      height: 12,
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.blueAccent,
+                                                        shape: BoxShape.circle,
+                                                        border: Border.all(color: Colors.white, width: 1.5),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          Align(
+                                            alignment: Alignment.bottomRight,
+                                            child: Transform.translate(
+                                              offset: const Offset(6, 6),
+                                              child: MouseRegion(
+                                                cursor: SystemMouseCursors.resizeUpLeftDownRight,
+                                                child: GestureDetector(
+                                                  behavior: HitTestBehavior.opaque,
+                                                  onPanUpdate: (details) {
+                                                    setState(() {
+                                                      final deltaW = details.delta.dx / pageRect.width;
+                                                      final newRelW = (sig.relWidth + deltaW).clamp(0.04, 1.0 - sig.relX);
+                                                      final newPixelW = newRelW * pageRect.width;
+                                                      final newPixelH = newPixelW / sig.aspectRatio;
+                                                      final newRelH = (newPixelH / pageRect.height).clamp(0.02, 1.0 - sig.relY);
+                                                      sig.relWidth = newRelW;
+                                                      sig.relHeight = newRelH;
+                                                    });
+                                                  },
+                                                  child: Padding(
+                                                    padding: const EdgeInsets.all(6.0),
+                                                    child: Container(
+                                                      width: 14,
+                                                      height: 14,
+                                                      decoration: BoxDecoration(
+                                                        color: Colors.blueAccent,
+                                                        shape: BoxShape.circle,
+                                                        border: Border.all(color: Colors.white, width: 1.5),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
                                         ],
                                       ],
                                     ),
@@ -1995,40 +2724,154 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     IconButton(
+                      tooltip: 'First Page',
                       icon: const Icon(Icons.first_page),
                       onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
                     ),
                     IconButton(
+                      tooltip: 'Previous Page',
                       icon: const Icon(Icons.chevron_left),
                       onPressed: _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 6),
                     InkWell(
                       borderRadius: BorderRadius.circular(8),
                       onTap: _showJumpPageDialog,
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                         decoration: BoxDecoration(
                           color: Theme.of(context).colorScheme.surface,
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
                         ),
-                        child: Text('Halaman $_currentPage / $_totalPages', style: const TextStyle(fontWeight: FontWeight.w600)),
+                        child: Text('Page $_currentPage / $_totalPages', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
                       ),
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: 6),
                     IconButton(
+                      tooltip: 'Next Page',
                       icon: const Icon(Icons.chevron_right),
                       onPressed: _currentPage < _totalPages ? () => _goToPage(_currentPage + 1) : null,
                     ),
                     IconButton(
+                      tooltip: 'Last Page',
                       icon: const Icon(Icons.last_page),
                       onPressed: _currentPage < _totalPages ? () => _goToPage(_totalPages) : null,
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+                      child: VerticalDivider(width: 1, color: Theme.of(context).colorScheme.outlineVariant),
+                    ),
+                    IconButton(
+                      tooltip: 'Zoom Out (-)',
+                      icon: const Icon(Icons.zoom_out),
+                      onPressed: _zoomOut,
+                    ),
+                    SizedBox(
+                      width: 130,
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 3,
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                          overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                        ),
+                        child: Slider(
+                          value: _currentZoom.clamp(0.5, 4.0),
+                          min: 0.5,
+                          max: 4.0,
+                          onChanged: (val) => _setZoomValue(val),
+                        ),
+                      ),
+                    ),
+                    InkWell(
+                      borderRadius: BorderRadius.circular(6),
+                      onTap: _resetZoom,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                        child: Text(
+                          '${(_currentZoom * 100).toInt()}%',
+                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Zoom In (+)',
+                      icon: const Icon(Icons.zoom_in),
+                      onPressed: _zoomIn,
                     ),
                   ],
                 ),
               ),
       ),
+    );
+  }
+
+  void _openPageManagerModal() {
+    if (_filePath == null || _totalPages <= 0) return;
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.layers_outlined),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Manage Pages (Page $_currentPage of $_totalPages)',
+                          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+                        ),
+                      ),
+                      IconButton(onPressed: () => Navigator.pop(ctx), icon: const Icon(Icons.close)),
+                    ],
+                  ),
+                  const Divider(),
+                  ListTile(
+                    leading: const Icon(Icons.post_add_outlined, color: Colors.indigo),
+                    title: const Text('Insert File (PDF / Image / Word)'),
+                    onTap: () { Navigator.pop(ctx); _openInsertPageModal(); },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.note_add_outlined, color: Colors.teal),
+                    title: const Text('Add Blank Page'),
+                    onTap: () { Navigator.pop(ctx); _insertBlankPage(); },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.copy_all_outlined, color: Colors.blue),
+                    title: const Text('Duplicate This Page'),
+                    onTap: () { Navigator.pop(ctx); _duplicateCurrentPage(); },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.low_priority_outlined, color: Colors.orange),
+                    title: const Text('Move Page Order...'),
+                    onTap: () { Navigator.pop(ctx); _moveCurrentPageDialog(); },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.ios_share_outlined, color: Colors.deepPurple),
+                    title: const Text('Extract Page to New PDF'),
+                    onTap: () { Navigator.pop(ctx); _extractCurrentPageToPdf(); },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.delete_forever_outlined, color: Colors.redAccent),
+                    title: const Text('Delete This Page', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w600)),
+                    onTap: () { Navigator.pop(ctx); _deleteCurrentPage(); },
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -2080,7 +2923,7 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Gambar Tanda Tangan'),
+      title: const Text('Draw Signature'),
       content: SizedBox(
         width: 450,
         child: Column(
@@ -2093,19 +2936,19 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Text('Tinta:'),
+                    const Text('Ink:'),
                     const SizedBox(width: 10),
-                    _buildColorCircle(Colors.black, 'Hitam'),
+                    _buildColorCircle(Colors.black, 'Black'),
                     const SizedBox(width: 8),
-                    _buildColorCircle(Colors.blue.shade800, 'Biru'),
+                    _buildColorCircle(Colors.blue.shade800, 'Blue'),
                     const SizedBox(width: 8),
-                    _buildColorCircle(Colors.red.shade800, 'Merah'),
+                    _buildColorCircle(Colors.red.shade800, 'Red'),
                   ],
                 ),
                 TextButton.icon(
                   onPressed: () => setState(() => _strokes.clear()),
                   icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('Bersihkan'),
+                  label: const Text('Clear'),
                 ),
               ],
             ),
@@ -2137,14 +2980,14 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
         ),
       ),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Batal')),
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
         FilledButton.icon(
           onPressed: () async {
             final bytes = await _exportToPngBytes();
             if (context.mounted) Navigator.pop(context, bytes);
           },
           icon: const Icon(Icons.check),
-          label: const Text('Simpan Tanda Tangan'),
+          label: const Text('Save Signature'),
         ),
       ],
     );

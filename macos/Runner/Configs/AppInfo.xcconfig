@@ -5,7 +5,11 @@
 // 'flutter create' template.
 
 // The application's name. By default this is also the title of the Flutter window.
+<<<<<<< HEAD
 PRODUCT_NAME = pdf_reader_app
+=======
+PRODUCT_NAME = Fajar PDF Reader
+>>>>>>> 3f3c3eb399718271ad744d45e9612c145fd58771
 
 // The application's bundle identifier
 PRODUCT_BUNDLE_IDENTIFIER = com.example.pdfReaderApp

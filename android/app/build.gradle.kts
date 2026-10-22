@@ -6,7 +6,11 @@ plugins {
 
 android {
     namespace = "com.example.pdf_reader_app"
+<<<<<<< HEAD
     compileSdk = flutter.compileSdkVersion
+=======
+    compileSdk = 37
+>>>>>>> 3f3c3eb399718271ad744d45e9612c145fd58771
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
