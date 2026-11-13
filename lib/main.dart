@@ -142,9 +142,12 @@ class PdfViewerScreen extends StatefulWidget {
 }
 
 class _PdfViewerScreenState extends State<PdfViewerScreen> {
+  AppLifecycleListener? _lifecycleListener;
   String? _filePath;
   String? _originalFilePath;
   String? _fileName;
+  Uint8List? _currentPdfBytes;
+  bool _hasUnsavedChanges = false;
   List<Map<String, String>> _recentFiles = [];
   final PdfViewerController _pdfController = PdfViewerController();
 
@@ -166,11 +169,28 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     _loadSavedSignatures();
     _loadRecentFiles();
 
+    _lifecycleListener = AppLifecycleListener(
+      onExitRequested: () async {
+        if (_filePath != null && _hasUnsavedChanges) {
+          final bool canExit = await _confirmUnsavedBeforeClose(isAppExit: true);
+          return canExit ? ui.AppExitResponse.exit : ui.AppExitResponse.cancel;
+        }
+        return ui.AppExitResponse.exit;
+      },
+    );
+
     if (widget.initialFilepath != null && widget.initialFilepath!.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _openPdfFromPath(widget.initialFilepath!);
       });
     }
+  }
+
+  @override
+  void dispose() {
+    _lifecycleListener?.dispose();
+    _searchController.dispose();
+    super.dispose();
   }
 
   @override
@@ -326,14 +346,17 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _removeRecentFile(path);
       return;
     }
+    final bytes = file.readAsBytesSync();
     final name = path.split(Platform.pathSeparator).last;
     setState(() {
       _filePath = path;
       _originalFilePath = path;
+      _currentPdfBytes = bytes;
       _fileName = name;
       _placedSignatures.clear();
       _selectedSigId = null;
       _activeSignatureBytes = null;
+      _hasUnsavedChanges = false;
       _currentPage = 1;
       _totalPages = 0;
       _currentZoom = 1.0;
@@ -347,8 +370,44 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
 
   Future<void> _shareCurrentPdf() async {
     if (_filePath == null) return;
+
+    if (_hasUnsavedChanges) {
+      final String? action = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Unsaved Changes'),
+          content: const Text(
+            'Do you want to save your latest changes before sharing so the updated document is shared?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel'),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'skip'),
+              child: const Text('Share Without Saving'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.pop(ctx, 'save'),
+              icon: const Icon(Icons.save_outlined, size: 18),
+              label: const Text('Save & Share'),
+            ),
+          ],
+        ),
+      );
+
+      if (action == null || action == 'cancel') return;
+
+      if (action == 'save') {
+        await _exportSignedPdf(saveAs: false);
+        if (_hasUnsavedChanges) return;
+      }
+    }
+
     try {
-      final xFile = XFile(_filePath!);
+      final String sharePath = _originalFilePath ?? _filePath!;
+      final xFile = XFile(sharePath);
       await Share.shareXFiles([xFile], text: 'PDF Document: $_fileName');
     } catch (e) {
       _showToast('Failed to share file: $e');
@@ -679,9 +738,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
         addFile('word/document.xml', documentXml);
 
         final zipData = ZipEncoder().encode(archive);
-        if (zipData != null) {
-          await File(finalPath).writeAsBytes(Uint8List.fromList(zipData), flush: true);
-        }
+        await File(finalPath).writeAsBytes(Uint8List.fromList(zipData), flush: true);
       }
 
       if (mounted) Navigator.pop(context);
@@ -740,42 +797,69 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
+  Future<bool> _confirmUnsavedBeforeClose({bool isAppExit = false}) async {
+    final String? action = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.orange),
+            SizedBox(width: 10),
+            Text('Unsaved Changes'),
+          ],
+        ),
+        content: Text(
+          isAppExit
+              ? 'You have unsaved changes in "${_fileName ?? 'this document'}". Do you want to save before exiting the application?'
+              : 'You have unsaved changes in "${_fileName ?? 'this document'}". Do you want to save before closing this document?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, 'discard'),
+            child: Text(isAppExit ? 'Exit Without Saving' : 'Close Without Saving'),
+          ),
+          FilledButton.icon(
+            onPressed: () => Navigator.pop(ctx, 'save'),
+            icon: const Icon(Icons.save_outlined, size: 18),
+            label: Text(isAppExit ? 'Save & Exit' : 'Save & Close'),
+          ),
+        ],
+      ),
+    );
+
+    if (action == null || action == 'cancel') return false;
+
+    if (action == 'save') {
+      await _exportSignedPdf(saveAs: false);
+      if (_hasUnsavedChanges) return false;
+    }
+
+    return true;
+  }
+
   Future<bool> _onWillPop() async {
     if (_filePath == null) {
       return true;
     }
 
-    if (_placedSignatures.isNotEmpty) {
-      final bool? shouldClose = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Unsaved Changes'),
-          content: const Text(
-            'You have signatures or edits that have not been saved to the PDF file. Are you sure you want to close this document?',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Close Without Saving'),
-            ),
-          ],
-        ),
-      );
-
-      if (shouldClose != true) return false;
+    if (_hasUnsavedChanges) {
+      final bool shouldClose = await _confirmUnsavedBeforeClose(isAppExit: false);
+      if (!shouldClose) return false;
     }
 
     setState(() {
       _filePath = null;
+      _currentPdfBytes = null;
       _fileName = null;
       _placedSignatures.clear();
       _selectedSigId = null;
       _activeSignatureBytes = null;
+      _hasUnsavedChanges = false;
     });
 
     return false;
@@ -841,7 +925,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
                         child: ListView.separated(
                           shrinkWrap: true,
                           itemCount: _recentFiles.length,
-                          separatorBuilder: (_, __) => const Divider(height: 1),
+                          separatorBuilder: (_, _) => const Divider(height: 1),
                           itemBuilder: (context, index) {
                             final item = _recentFiles[index];
                             final path = item['path'] ?? '';
@@ -950,6 +1034,7 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       setState(() {
         _fileName = 'MyDocument.pdf';
         _originalFilePath = null; // Menandakan file baru belum punya path asli
+        _hasUnsavedChanges = true;
       });
     _showToast('New PDF created successfully. You can now edit or save it.');
   } catch (e) {
@@ -1086,119 +1171,125 @@ Future<void> _pickPdfFile() async {
   Future<void> _exportSignedPdf({required bool saveAs}) async {
     if (_filePath == null) return;
 
-    final originalFile = File(_filePath!);
-    final originalBytes = await originalFile.readAsBytes();
+    final originalBytes = _currentPdfBytes ?? await File(_filePath!).readAsBytes();
     final originalSizeKb = originalBytes.length / 1024;
 
     bool useOriginalSize = true;
     double scaleFactor = 0.6;
 
-    if (!mounted) return;
-    final bool? confirmSave = await showDialog<bool>(
-      context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (context, setStateModal) {
-            final estimatedKb = useOriginalSize
-                ? originalSizeKb
-                : (originalSizeKb * (scaleFactor * scaleFactor)).clamp(15.0, originalSizeKb);
+    // Munculkan pilihan Save Options & Compression hanya ketika memilih Save As
+    if (saveAs) {
+      if (!mounted) return;
+      final bool? confirmSave = await showDialog<bool>(
+        context: context,
+        builder: (ctx) {
+          return StatefulBuilder(
+            builder: (context, setStateModal) {
+              final estimatedKb = useOriginalSize
+                  ? originalSizeKb
+                  : (originalSizeKb * (scaleFactor * scaleFactor)).clamp(15.0, originalSizeKb);
 
-            final sizeText = estimatedKb > 1024
-                ? '${(estimatedKb / 1024).toStringAsFixed(2)} MB'
-                : '${estimatedKb.toStringAsFixed(0)} KB';
+              final sizeText = estimatedKb > 1024
+                  ? '${(estimatedKb / 1024).toStringAsFixed(2)} MB'
+                  : '${estimatedKb.toStringAsFixed(0)} KB';
 
-            return AlertDialog(
-              title: const Text('Save Options & PDF Compression'),
-              content: SizedBox(
-                width: 400,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Select PDF save method:'),
-                    const SizedBox(height: 16),
-                    RadioListTile<bool>(
-                      title: const Text('Original Size (Full Quality)'),
-                      subtitle: Text(
-                          'Estimated: ${originalSizeKb > 1024 ? "${(originalSizeKb / 1024).toStringAsFixed(2)} MB" : "${originalSizeKb.toStringAsFixed(0)} KB"}'),
-                      value: true,
-                      groupValue: useOriginalSize,
-                      onChanged: (val) => setStateModal(() => useOriginalSize = val!),
-                    ),
-                    RadioListTile<bool>(
-                      title: const Text('Shrink Entire PDF'),
-                      subtitle: const Text('Compress resolution of all document pages & signatures'),
-                      value: false,
-                      groupValue: useOriginalSize,
-                      onChanged: (val) => setStateModal(() => useOriginalSize = val!),
-                    ),
-                    if (!useOriginalSize) ...[
-                      const SizedBox(height: 10),
-                      Text('Compression Scale: ${(scaleFactor * 100).toInt()}%'),
-                      Slider(
-                        value: scaleFactor.clamp(0.3, 0.9),
-                        min: 0.3,
-                        max: 0.9,
-                        divisions: 6,
-                        label: '${(scaleFactor * 100).toInt()}%',
-                        onChanged: (val) => setStateModal(() => scaleFactor = val.clamp(0.3, 0.9)),
+              return AlertDialog(
+                title: const Text('Save Options & PDF Compression'),
+                content: SizedBox(
+                  width: 400,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('Select PDF save method:'),
+                      const SizedBox(height: 16),
+                      RadioListTile<bool>(
+                        title: const Text('Original Size (Full Quality)'),
+                        subtitle: Text(
+                            'Estimated: ${originalSizeKb > 1024 ? "${(originalSizeKb / 1024).toStringAsFixed(2)} MB" : "${originalSizeKb.toStringAsFixed(0)} KB"}'),
+                        value: true,
+                        groupValue: useOriginalSize,
+                        onChanged: (val) => setStateModal(() => useOriginalSize = val!),
+                      ),
+                      RadioListTile<bool>(
+                        title: const Text('Shrink Entire PDF'),
+                        subtitle: const Text('Compress resolution of all document pages & signatures'),
+                        value: false,
+                        groupValue: useOriginalSize,
+                        onChanged: (val) => setStateModal(() => useOriginalSize = val!),
+                      ),
+                      if (!useOriginalSize) ...[
+                        const SizedBox(height: 10),
+                        Text('Compression Scale: ${(scaleFactor * 100).toInt()}%'),
+                        Slider(
+                          value: scaleFactor.clamp(0.3, 0.9),
+                          min: 0.3,
+                          max: 0.9,
+                          divisions: 6,
+                          label: '${(scaleFactor * 100).toInt()}%',
+                          onChanged: (val) => setStateModal(() => scaleFactor = val.clamp(0.3, 0.9)),
+                        ),
+                      ],
+                      const Divider(height: 24),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.info_outline, size: 20),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Estimated Output Size: $sizeText',
+                                style: const TextStyle(fontWeight: FontWeight.bold),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ],
-                    const Divider(height: 24),
-                    Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          const Icon(Icons.info_outline, size: 20),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Text(
-                              'Estimated Output Size: $sizeText',
-                              style: const TextStyle(fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, false),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton.icon(
-                  onPressed: () => Navigator.pop(ctx, true),
-                  icon: const Icon(Icons.save_alt, size: 18),
-                  label: const Text('Save File'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx, false),
+                    child: const Text('Cancel'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: () => Navigator.pop(ctx, true),
+                    icon: const Icon(Icons.save_alt, size: 18),
+                    label: const Text('Save File'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
 
-    if (confirmSave != true || !mounted) return;
+      if (confirmSave != true || !mounted) return;
+    }
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => const AlertDialog(
-        content: Row(
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(width: 20),
-            Expanded(child: Text('Processing & compressing PDF document...')),
-          ],
+    bool loadingShown = false;
+    if (!useOriginalSize && mounted) {
+      loadingShown = true;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const AlertDialog(
+          content: Row(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(width: 20),
+              Expanded(child: Text('Processing & compressing PDF document...')),
+            ],
+          ),
         ),
-      ),
-    );
+      );
+    }
 
     try {
       Uint8List signedBytes;
@@ -1231,7 +1322,7 @@ Future<void> _pickPdfFile() async {
         signedBytes = Uint8List.fromList(await pdfDoc.save());
         pdfDoc.dispose();
       } else {
-        final sourceDoc = await PdfDocument.openFile(_filePath!);
+        final sourceDoc = await PdfDocument.openData(originalBytes);
         final newPdfDoc = sf.PdfDocument();
         newPdfDoc.compressionLevel = sf.PdfCompressionLevel.best;
         newPdfDoc.pageSettings.margins.all = 0;
@@ -1300,16 +1391,16 @@ Future<void> _pickPdfFile() async {
         newPdfDoc.dispose();
       }
 
-      if (mounted) Navigator.pop(context);
+      if (loadingShown && mounted && Navigator.canPop(context)) {
+        Navigator.pop(context);
+      }
 
       final savedSizeKb = signedBytes.length / 1024;
       final savedSizeText = savedSizeKb > 1024
           ? '${(savedSizeKb / 1024).toStringAsFixed(2)} MB'
           : '${savedSizeKb.toStringAsFixed(0)} KB';
 
-      // Jika file baru (Create PDF) atau memilih Save As
       if (saveAs || _originalFilePath == null) {
-        // Jika file baru, gunakan nama bersih atau biarkan kosong/default yang bagus tanpa kata 'Untitled' kaku
         final defaultName = _originalFilePath == null ? 'MyDocument.pdf' : 'Signed_${_fileName ?? "document.pdf"}';
         final Uri? saveUri = await FilePicker.saveFile(
           dialogTitle: 'Save PDF As',
@@ -1329,61 +1420,47 @@ Future<void> _pickPdfFile() async {
           await File(finalPath).writeAsBytes(signedBytes, flush: true);
 
           if (mounted) {
-            _showToast(
-              'Successfully saved ($savedSizeText): ${finalPath.split(Platform.pathSeparator).last}',
-              actionLabel: 'Open File',
-              onAction: () {
-                setState(() {
-                  _filePath = finalPath;
-                  _fileName = finalPath.split(Platform.pathSeparator).last;
-                  _placedSignatures.clear();
-                  _selectedSigId = null;
-                });
-              },
-            );
+            setState(() {
+              _originalFilePath = finalPath;
+              _filePath = finalPath;
+              _fileName = finalPath.split(Platform.pathSeparator).last;
+              _hasUnsavedChanges = false;
+            });
+            _addToRecentFiles(finalPath, _fileName);
+            _showToast('Successfully saved ($savedSizeText): $_fileName');
           }
         } else {
-          // Setelah file baru disimpan, langsung set acuan path baru dan buka file tersebut otomatis
           final tempDir = await getTemporaryDirectory();
-          final saveFileName = _originalFilePath == null ? (_fileName ?? 'Untitled.pdf') : 'Signed_${_fileName ?? "document.pdf"}';
+          final saveFileName = _originalFilePath == null ? (_fileName ?? 'MyDocument.pdf') : 'Signed_${_fileName ?? "document.pdf"}';
           final tempSavedFile = File('${tempDir.path}${Platform.pathSeparator}$saveFileName');
           await tempSavedFile.writeAsBytes(signedBytes, flush: true);
 
           if (mounted) {
             setState(() {
               _originalFilePath = tempSavedFile.path;
+              _filePath = tempSavedFile.path;
               _fileName = saveFileName;
-              _placedSignatures.clear();
-              _selectedSigId = null;
+              _hasUnsavedChanges = false;
             });
-            _openPdfFromPath(tempSavedFile.path);
-            _showToast('Successfully saved and opened ($savedSizeText)');
+            _showToast('Successfully saved ($savedSizeText)');
           }
         }
       } else {
-        final String finalPath = _originalFilePath ?? _filePath!;
-        final int lastPage = _currentPage;
-
-        setState(() => _filePath = null);
-        await Future.delayed(const Duration(milliseconds: 150));
-
+        final String finalPath = _originalFilePath!;
         final outFile = File(finalPath);
         await outFile.writeAsBytes(signedBytes, flush: true);
 
         if (mounted) {
           setState(() {
-            _filePath = finalPath;
-            _placedSignatures.clear();
-            _selectedSigId = null;
-          });
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            Future.delayed(const Duration(milliseconds: 200), () => _goToPage(lastPage));
+            _hasUnsavedChanges = false;
           });
           _showToast('File successfully updated ($savedSizeText)');
         }
       }
     } catch (e) {
-      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+      if (loadingShown && mounted && Navigator.canPop(context)) {
+        Navigator.pop(context);
+      }
       _showToast('Failed to save PDF: $e');
     }
   }
@@ -1488,7 +1565,7 @@ Future<void> _pickPdfFile() async {
                         child: ListView.separated(
                           scrollDirection: Axis.horizontal,
                           itemCount: _savedSignatureFiles.length,
-                          separatorBuilder: (_, __) => const SizedBox(width: 12),
+                          separatorBuilder: (_, _) => const SizedBox(width: 12),
                           itemBuilder: (context, index) {
                             final file = _savedSignatureFiles[index];
                             final bytes = file.readAsBytesSync();
@@ -1827,13 +1904,17 @@ Future<void> _pickPdfFile() async {
       final int addedCount = insDoc.pages.count;
 
       if (insertAfterPage <= 0) {
-        for (int j = 0; j < addedCount; j++) copyPageToOut(insDoc.pages[j]);
+        for (int j = 0; j < addedCount; j++) {
+          copyPageToOut(insDoc.pages[j]);
+        }
       }
 
       for (int i = 0; i < baseCount; i++) {
         copyPageToOut(baseDoc.pages[i]);
         if (i + 1 == insertAfterPage) {
-          for (int j = 0; j < addedCount; j++) copyPageToOut(insDoc.pages[j]);
+          for (int j = 0; j < addedCount; j++) {
+            copyPageToOut(insDoc.pages[j]);
+          }
         }
       }
 
@@ -1851,7 +1932,11 @@ Future<void> _pickPdfFile() async {
 
       if (mounted) Navigator.pop(context);
 
-      setState(() => _filePath = tempWorkFile.path);
+      setState(() {
+        _filePath = tempWorkFile.path;
+        _currentPdfBytes = mergedBytes;
+        _hasUnsavedChanges = true;
+      });
       WidgetsBinding.instance.addPostFrameCallback((_) {
         Future.delayed(const Duration(milliseconds: 250), () => _goToPage(insertAfterPage + 1));
       });
@@ -1883,9 +1968,13 @@ Future<void> _pickPdfFile() async {
     final tempWorkFile = File('${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}.pdf');
     await tempWorkFile.writeAsBytes(bytes, flush: true);
 
-    setState(() => _filePath = tempWorkFile.path);
+    setState(() {
+      _filePath = tempWorkFile.path;
+      _currentPdfBytes = bytes;
+      _hasUnsavedChanges = true;
+    });
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      Future.delayed(const Duration(milliseconds: 250), () => _goToPage(targetPage));
+      Future.delayed(const Duration(milliseconds: 200), () => _goToPage(targetPage));
     });
     _showToast(toastMsg);
   }
@@ -2042,7 +2131,9 @@ Future<void> _pickPdfFile() async {
       final int movedIdx = order.removeAt(_currentPage - 1);
       order.insert(newPos - 1, movedIdx);
 
-      for (final idx in order) _copyPageToDoc(outDoc, baseDoc.pages[idx]);
+      for (final idx in order) {
+        _copyPageToDoc(outDoc, baseDoc.pages[idx]);
+      }
 
       for (final sig in _placedSignatures) {
         final oldIdx = sig.pageNumber - 1;
@@ -2129,7 +2220,39 @@ Future<void> _pickPdfFile() async {
                     }
                   },
                 )
-              : Text(_fileName ?? 'Fajar PDF Reader', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18)),
+              : Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Flexible(
+                      child: Text(
+                        _fileName != null
+                            ? '${_hasUnsavedChanges ? "* " : ""}$_fileName'
+                            : 'Fajar PDF Reader',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 18),
+                      ),
+                    ),
+                    if (_filePath != null && _hasUnsavedChanges) ...[
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.orange.shade400, width: 1),
+                        ),
+                        child: Text(
+                          'Unsaved',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.orange.shade800,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
           centerTitle: false,
           actions: [
             if (_filePath != null) ...[
@@ -2180,12 +2303,18 @@ Future<void> _pickPdfFile() async {
                 ),
               ],
             ],
-            if (_filePath != null)
+            if (_filePath != null) ...[
+              IconButton(
+                tooltip: 'Share Document',
+                icon: const Icon(Icons.share_outlined),
+                onPressed: _shareCurrentPdf,
+              ),
               IconButton(
                 tooltip: 'Print Document',
                 icon: const Icon(Icons.print_outlined),
                 onPressed: _printCurrentPdf,
               ),
+            ],
             const SizedBox(width: 4),
           ],
         ),
@@ -2214,12 +2343,15 @@ Future<void> _pickPdfFile() async {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      _fileName ?? 'No document open',
+                      _fileName != null
+                          ? '${_hasUnsavedChanges ? "* " : ""}$_fileName${_hasUnsavedChanges ? " (Unsaved)" : ""}'
+                          : 'No document open',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
                         fontSize: 12,
-                        color: Theme.of(context).colorScheme.onPrimaryContainer.withValues(alpha: 0.8),
+                        fontWeight: _hasUnsavedChanges ? FontWeight.w600 : FontWeight.normal,
+                        color: Theme.of(context).colorScheme.onPrimaryContainer.withValues(alpha: 0.85),
                       ),
                     ),
                   ],
@@ -2298,25 +2430,50 @@ Future<void> _pickPdfFile() async {
                     ),
                   ],
                 ),
-                ListTile(
-                  leading: const Icon(Icons.layers_outlined),
-                  title: const Text('Manage Pages'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _openPageManagerModal();
-                  },
+                ExpansionTile(
+                  leading: const Icon(Icons.edit_outlined),
+                  title: const Text('Edit'),
+                  childrenPadding: const EdgeInsets.only(left: 16),
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.layers_outlined),
+                      title: const Text('Manage Pages'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _openPageManagerModal();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.draw_outlined),
+                      title: const Text('Signature Bank'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        _openSignatureManager();
+                      },
+                    ),
+                  ],
                 ),
                 ListTile(
-                  leading: const Icon(Icons.draw_outlined),
-                  title: const Text('Signature Bank'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _openSignatureManager();
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.save_outlined),
-                  title: const Text('Save'),
+                  leading: Icon(
+                    Icons.save_outlined,
+                    color: _hasUnsavedChanges ? Colors.orange.shade700 : null,
+                  ),
+                  title: Text(
+                    _hasUnsavedChanges ? 'Save *' : 'Save',
+                    style: TextStyle(
+                      fontWeight: _hasUnsavedChanges ? FontWeight.bold : FontWeight.normal,
+                    ),
+                  ),
+                  trailing: _hasUnsavedChanges
+                      ? Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            color: Colors.orange,
+                            shape: BoxShape.circle,
+                          ),
+                        )
+                      : null,
                   onTap: () {
                     Navigator.pop(context);
                     _exportSignedPdf(saveAs: false);
@@ -2423,8 +2580,9 @@ Future<void> _pickPdfFile() async {
                   )
                 : GestureDetector(
                     onTap: () => setState(() => _selectedSigId = null),
-                    child: PdfViewer.file(
-                      _filePath!,
+                    child: PdfViewer.data(
+                      _currentPdfBytes!,
+                      sourceName: _filePath!,
                       controller: _pdfController,
                       params: PdfViewerParams(
                         pagePaintCallbacks: [
@@ -2502,6 +2660,7 @@ Future<void> _pickPdfFile() async {
                                         _placedSignatures.add(newSig);
                                         _selectedSigId = newSig.id;
                                         _activeSignatureBytes = null;
+                                        _hasUnsavedChanges = true;
                                       });
                                     });
                                   },
@@ -2543,6 +2702,7 @@ Future<void> _pickPdfFile() async {
                                     onPanUpdate: (details) {
                                       setState(() {
                                         _selectedSigId = sig.id;
+                                        _hasUnsavedChanges = true;
                                         sig.relX = (sig.relX + details.delta.dx / pageRect.width).clamp(0.0, (1.0 - sig.relWidth).clamp(0.0, 1.0));
                                         sig.relY = (sig.relY + details.delta.dy / pageRect.height).clamp(0.0, (1.0 - sig.relHeight).clamp(0.0, 1.0));
                                       });
@@ -2569,7 +2729,10 @@ Future<void> _pickPdfFile() async {
                                                 child: GestureDetector(
                                                   behavior: HitTestBehavior.opaque,
                                                   onPanUpdate: (details) {
-                                                    setState(() => sig.rotation += details.delta.dx * 0.03);
+                                                    setState(() {
+                                                      sig.rotation += details.delta.dx * 0.03;
+                                                      _hasUnsavedChanges = true;
+                                                    });
                                                   },
                                                   child: Padding(
                                                     padding: const EdgeInsets.all(10.0),
@@ -2592,7 +2755,10 @@ Future<void> _pickPdfFile() async {
                                             top: -10,
                                             right: -10,
                                             child: GestureDetector(
-                                              onTap: () => setState(() => _placedSignatures.remove(sig)),
+                                              onTap: () => setState(() {
+                                                _placedSignatures.remove(sig);
+                                                _hasUnsavedChanges = true;
+                                              }),
                                               child: const CircleAvatar(
                                                 radius: 10,
                                                 backgroundColor: Colors.redAccent,
@@ -2612,6 +2778,7 @@ Future<void> _pickPdfFile() async {
                                                     setState(() {
                                                       final deltaW = details.delta.dx / pageRect.width;
                                                       sig.relWidth = (sig.relWidth + deltaW).clamp(0.04, 1.0 - sig.relX);
+                                                      _hasUnsavedChanges = true;
                                                     });
                                                   },
                                                   child: Padding(
@@ -2642,6 +2809,7 @@ Future<void> _pickPdfFile() async {
                                                     setState(() {
                                                       final deltaH = details.delta.dy / pageRect.height;
                                                       sig.relHeight = (sig.relHeight + deltaH).clamp(0.02, 1.0 - sig.relY);
+                                                      _hasUnsavedChanges = true;
                                                     });
                                                   },
                                                   child: Padding(
@@ -2677,6 +2845,7 @@ Future<void> _pickPdfFile() async {
                                                       final newRelH = (newPixelH / pageRect.height).clamp(0.02, 1.0 - sig.relY);
                                                       sig.relWidth = newRelW;
                                                       sig.relHeight = newRelH;
+                                                      _hasUnsavedChanges = true;
                                                     });
                                                   },
                                                   child: Padding(
@@ -2907,7 +3076,9 @@ class _DrawSignatureDialogState extends State<DrawSignatureDialog> {
     for (final stroke in _strokes) {
       if (stroke.length > 1) {
         final path = Path()..moveTo(stroke.first.dx, stroke.first.dy);
-        for (int i = 1; i < stroke.length; i++) path.lineTo(stroke[i].dx, stroke[i].dy);
+        for (int i = 1; i < stroke.length; i++) {
+          path.lineTo(stroke[i].dx, stroke[i].dy);
+        }
         canvas.drawPath(path, paint);
       } else if (stroke.isNotEmpty) {
         canvas.drawPoints(ui.PointMode.points, stroke, paint);
@@ -3027,7 +3198,9 @@ class _SignaturePainter extends CustomPainter {
     for (final stroke in strokes) {
       if (stroke.length > 1) {
         final path = Path()..moveTo(stroke.first.dx, stroke.first.dy);
-        for (int i = 1; i < stroke.length; i++) path.lineTo(stroke[i].dx, stroke[i].dy);
+        for (int i = 1; i < stroke.length; i++) {
+          path.lineTo(stroke[i].dx, stroke[i].dy);
+        }
         canvas.drawPath(path, paint);
       } else if (stroke.isNotEmpty) {
         canvas.drawPoints(ui.PointMode.points, stroke, paint);
