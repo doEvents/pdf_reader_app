@@ -123,6 +123,30 @@ class PlacedSignature {
     this.relHeight = 0.1,
     this.rotation = 0.0,
   });
+
+  PlacedSignature copy() {
+    return PlacedSignature(
+      id: id,
+      pageNumber: pageNumber,
+      imageBytes: imageBytes,
+      aspectRatio: aspectRatio,
+      relX: relX,
+      relY: relY,
+      relWidth: relWidth,
+      relHeight: relHeight,
+      rotation: rotation,
+    );
+  }
+}
+
+class _EditorSnapshot {
+  final Uint8List pdfBytes;
+  final List<PlacedSignature> signatures;
+
+  _EditorSnapshot({
+    required this.pdfBytes,
+    required List<PlacedSignature> signatures,
+  }) : signatures = signatures.map((s) => s.copy()).toList();
 }
 
 class PdfViewerScreen extends StatefulWidget {
@@ -155,6 +179,74 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
   List<File> _savedSignatureFiles = [];
   String? _selectedSigId;
   Uint8List? _activeSignatureBytes;
+
+  final List<_EditorSnapshot> _undoStack = [];
+  final List<_EditorSnapshot> _redoStack = [];
+  bool _isDraggingOrResizingSig = false;
+
+  bool get _canUndo => _undoStack.isNotEmpty;
+  bool get _canRedo => _redoStack.isNotEmpty;
+
+  void _recordHistoryState() {
+    if (_currentPdfBytes == null) return;
+    _undoStack.add(
+      _EditorSnapshot(
+        pdfBytes: _currentPdfBytes!,
+        signatures: _placedSignatures,
+      ),
+    );
+    if (_undoStack.length > 30) {
+      _undoStack.removeAt(0);
+    }
+    _redoStack.clear();
+  }
+
+  Future<void> _applySnapshot(_EditorSnapshot snapshot) async {
+    final bool pdfChanged = !identical(_currentPdfBytes, snapshot.pdfBytes);
+    String newPath = _filePath!;
+
+    if (pdfChanged) {
+      final tempWorkFile = File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}.pdf',
+      );
+      await tempWorkFile.writeAsBytes(snapshot.pdfBytes, flush: true);
+      newPath = tempWorkFile.path;
+    }
+
+    setState(() {
+      _filePath = newPath;
+      _currentPdfBytes = snapshot.pdfBytes;
+      _placedSignatures
+        ..clear()
+        ..addAll(snapshot.signatures.map((s) => s.copy()));
+      _selectedSigId = null;
+      _hasUnsavedChanges = true;
+    });
+  }
+
+  Future<void> _undo() async {
+    if (!_canUndo || _currentPdfBytes == null) return;
+    _redoStack.add(
+      _EditorSnapshot(
+        pdfBytes: _currentPdfBytes!,
+        signatures: _placedSignatures,
+      ),
+    );
+    final prev = _undoStack.removeLast();
+    await _applySnapshot(prev);
+  }
+
+  Future<void> _redo() async {
+    if (!_canRedo || _currentPdfBytes == null) return;
+    _undoStack.add(
+      _EditorSnapshot(
+        pdfBytes: _currentPdfBytes!,
+        signatures: _placedSignatures,
+      ),
+    );
+    final next = _redoStack.removeLast();
+    await _applySnapshot(next);
+  }
 
   int _currentPage = 1;
   int _totalPages = 0;
@@ -354,6 +446,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _currentPdfBytes = bytes;
       _fileName = name;
       _placedSignatures.clear();
+      _undoStack.clear();
+      _redoStack.clear();
       _selectedSigId = null;
       _activeSignatureBytes = null;
       _hasUnsavedChanges = false;
@@ -414,19 +508,64 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
     }
   }
 
+  Future<Uint8List> _buildPrintablePdfBytes() async {
+    final baseBytes = _currentPdfBytes ?? await File(_filePath!).readAsBytes();
+    if (_placedSignatures.isEmpty) return baseBytes;
+
+    final pdfDoc = sf.PdfDocument(inputBytes: baseBytes);
+    pdfDoc.fileStructure.incrementalUpdate = false;
+
+    for (final sig in _placedSignatures) {
+      final pageIndex = sig.pageNumber - 1;
+      if (pageIndex >= 0 && pageIndex < pdfDoc.pages.count) {
+        final page = pdfDoc.pages[pageIndex];
+        final pageSize = page.getClientSize();
+
+        page.graphics.save();
+        final x = sig.relX * pageSize.width;
+        final y = sig.relY * pageSize.height;
+        final w = sig.relWidth * pageSize.width;
+        final h = sig.relHeight * pageSize.height;
+
+        page.graphics.translateTransform(x + w / 2, y + h / 2);
+        page.graphics.rotateTransform(sig.rotation * (180 / 3.141592653589793));
+
+        final bitmap = sf.PdfBitmap(sig.imageBytes);
+        page.graphics.drawImage(bitmap, Rect.fromLTWH(-w / 2, -h / 2, w, h));
+        page.graphics.restore();
+      }
+    }
+
+    final result = Uint8List.fromList(await pdfDoc.save());
+    pdfDoc.dispose();
+    return result;
+  }
+
   Future<void> _printCurrentPdf() async {
     if (_filePath == null) return;
+    if (_selectedSigId != null) {
+      setState(() => _selectedSigId = null);
+    }
+
     try {
-      final file = File(_filePath!);
-      if (!await file.exists()) {
-        _showToast('Document file not found.');
-        return;
-      }
-      final bytes = await file.readAsBytes();
-      await Printing.layoutPdf(
+      final bytes = await _buildPrintablePdfBytes();
+      final printed = await Printing.layoutPdf(
         name: _fileName ?? 'Document',
+        usePrinterSettings: true,
         onLayout: (format) async => bytes,
       );
+
+      if (!printed && (Platform.isMacOS || Platform.isWindows)) {
+        final tempPrintFile = File(
+          '${Directory.systemTemp.path}${Platform.pathSeparator}print_${DateTime.now().millisecondsSinceEpoch}.pdf',
+        );
+        await tempPrintFile.writeAsBytes(bytes, flush: true);
+        if (Platform.isMacOS) {
+          await Process.run('open', ['-a', 'Preview', tempPrintFile.path]);
+        } else if (Platform.isWindows) {
+          await Process.run('cmd', ['/c', 'start', '', tempPrintFile.path]);
+        }
+      }
     } catch (e) {
       _showToast('Failed to print document: $e');
     }
@@ -857,6 +996,8 @@ class _PdfViewerScreenState extends State<PdfViewerScreen> {
       _currentPdfBytes = null;
       _fileName = null;
       _placedSignatures.clear();
+      _undoStack.clear();
+      _redoStack.clear();
       _selectedSigId = null;
       _activeSignatureBytes = null;
       _hasUnsavedChanges = false;
@@ -1170,6 +1311,10 @@ Future<void> _pickPdfFile() async {
 
   Future<void> _exportSignedPdf({required bool saveAs}) async {
     if (_filePath == null) return;
+
+    if (_selectedSigId != null) {
+      setState(() => _selectedSigId = null);
+    }
 
     final originalBytes = _currentPdfBytes ?? await File(_filePath!).readAsBytes();
     final originalSizeKb = originalBytes.length / 1024;
@@ -1932,6 +2077,7 @@ Future<void> _pickPdfFile() async {
 
       if (mounted) Navigator.pop(context);
 
+      _recordHistoryState();
       setState(() {
         _filePath = tempWorkFile.path;
         _currentPdfBytes = mergedBytes;
@@ -1968,6 +2114,7 @@ Future<void> _pickPdfFile() async {
     final tempWorkFile = File('${Directory.systemTemp.path}${Platform.pathSeparator}working_${DateTime.now().millisecondsSinceEpoch}.pdf');
     await tempWorkFile.writeAsBytes(bytes, flush: true);
 
+    _recordHistoryState();
     setState(() {
       _filePath = tempWorkFile.path;
       _currentPdfBytes = bytes;
@@ -2255,68 +2402,153 @@ Future<void> _pickPdfFile() async {
                 ),
           centerTitle: false,
           actions: [
-            if (_filePath != null) ...[
-              if (_isSearching && _textSearcher != null) ...[
-                ListenableBuilder(
-                  listenable: _textSearcher!,
-                  builder: (context, _) {
-                    final matches = _textSearcher!.matches;
-                    final currentIdx = _textSearcher!.currentIndex;
-                    final total = matches.length;
-                    return Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          total > 0 ? '${(currentIdx ?? 0) + 1}/$total' : '0/0',
-                          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                        ),
-                        IconButton(
-                          tooltip: 'Previous match',
-                          icon: const Icon(Icons.keyboard_arrow_up),
-                          onPressed: total > 0 ? () => _textSearcher!.goToPrevMatch() : null,
-                        ),
-                        IconButton(
-                          tooltip: 'Next match',
-                          icon: const Icon(Icons.keyboard_arrow_down),
-                          onPressed: total > 0 ? () => _textSearcher!.goToNextMatch() : null,
-                        ),
-                      ],
-                    );
-                  },
-                ),
-                IconButton(
-                  tooltip: 'Close search',
-                  icon: const Icon(Icons.close),
-                  onPressed: () {
-                    setState(() {
-                      _isSearching = false;
-                      _searchController.clear();
-                      _textSearcher?.resetTextSearch();
-                    });
-                  },
-                ),
-              ] else ...[
-                IconButton(
-                  tooltip: 'Search in PDF',
-                  icon: const Icon(Icons.search),
-                  onPressed: () => setState(() => _isSearching = true),
-                ),
-              ],
-            ],
-            if (_filePath != null) ...[
-              IconButton(
-                tooltip: 'Share Document',
-                icon: const Icon(Icons.share_outlined),
-                onPressed: _shareCurrentPdf,
+            if (_filePath != null && _isSearching && _textSearcher != null) ...[
+              ListenableBuilder(
+                listenable: _textSearcher!,
+                builder: (context, _) {
+                  final matches = _textSearcher!.matches;
+                  final currentIdx = _textSearcher!.currentIndex;
+                  final total = matches.length;
+                  return Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        total > 0 ? '${(currentIdx ?? 0) + 1}/$total' : '0/0',
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                      ),
+                      IconButton(
+                        tooltip: 'Previous match',
+                        icon: const Icon(Icons.keyboard_arrow_up),
+                        onPressed: total > 0 ? () => _textSearcher!.goToPrevMatch() : null,
+                      ),
+                      IconButton(
+                        tooltip: 'Next match',
+                        icon: const Icon(Icons.keyboard_arrow_down),
+                        onPressed: total > 0 ? () => _textSearcher!.goToNextMatch() : null,
+                      ),
+                    ],
+                  );
+                },
               ),
               IconButton(
-                tooltip: 'Print Document',
-                icon: const Icon(Icons.print_outlined),
-                onPressed: _printCurrentPdf,
+                tooltip: 'Close search',
+                icon: const Icon(Icons.close),
+                onPressed: () {
+                  setState(() {
+                    _isSearching = false;
+                    _searchController.clear();
+                    _textSearcher?.resetTextSearch();
+                  });
+                },
               ),
+              const SizedBox(width: 4),
             ],
-            const SizedBox(width: 4),
           ],
+          bottom: _filePath == null
+              ? null
+              : PreferredSize(
+                  preferredSize: const Size.fromHeight(46),
+                  child: Container(
+                    height: 46,
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.surfaceContainerLow,
+                      border: Border(
+                        top: BorderSide(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                          width: 0.7,
+                        ),
+                        bottom: BorderSide(
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                          width: 0.8,
+                        ),
+                      ),
+                    ),
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Row(
+                        children: [
+                          // Grup 1: Penyimpanan (Save & Save As)
+                          _buildToolbarButton(
+                            icon: Icons.save_outlined,
+                            label: 'Save',
+                            iconColor: _hasUnsavedChanges ? Colors.orange.shade700 : null,
+                            isHighlighted: _hasUnsavedChanges,
+                            onPressed: () => _exportSignedPdf(saveAs: false),
+                          ),
+                          const SizedBox(width: 4),
+                          _buildToolbarButton(
+                            icon: Icons.save_as_outlined,
+                            label: 'Save As',
+                            onPressed: () => _exportSignedPdf(saveAs: true),
+                          ),
+                          _buildToolbarDivider(),
+
+                          // Grup 2: Distribusi & Cetak (Print & Share)
+                          _buildToolbarButton(
+                            icon: Icons.print_outlined,
+                            label: 'Print',
+                            onPressed: _printCurrentPdf,
+                          ),
+                          const SizedBox(width: 4),
+                          _buildToolbarButton(
+                            icon: Icons.share_outlined,
+                            label: 'Share',
+                            onPressed: _shareCurrentPdf,
+                          ),
+                          _buildToolbarDivider(),
+
+                          // Grup 3: Riwayat Perubahan (Undo & Redo)
+                          _buildToolbarButton(
+                            icon: Icons.undo_rounded,
+                            label: 'Undo',
+                            onPressed: _canUndo ? _undo : null,
+                          ),
+                          const SizedBox(width: 2),
+                          _buildToolbarButton(
+                            icon: Icons.redo_rounded,
+                            label: 'Redo',
+                            onPressed: _canRedo ? _redo : null,
+                          ),
+                          _buildToolbarDivider(),
+
+                          // Grup 4: Penyuntingan Dokumen (Sign & Manage Pages)
+                          _buildToolbarButton(
+                            icon: Icons.draw_outlined,
+                            label: 'Sign',
+                            onPressed: _openSignatureManager,
+                          ),
+                          const SizedBox(width: 4),
+                          _buildToolbarButton(
+                            icon: Icons.layers_outlined,
+                            label: 'Manage Pages',
+                            onPressed: _openPageManagerModal,
+                          ),
+                          _buildToolbarDivider(),
+
+                          // Grup 4: Pencarian (Find)
+                          _buildToolbarButton(
+                            icon: _isSearching ? Icons.search_off : Icons.search,
+                            label: 'Find',
+                            isHighlighted: _isSearching,
+                            onPressed: () {
+                              setState(() {
+                                if (_isSearching) {
+                                  _isSearching = false;
+                                  _searchController.clear();
+                                  _textSearcher?.resetTextSearch();
+                                } else {
+                                  _isSearching = true;
+                                }
+                              });
+                            },
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
         ),
         // MENU HAMBURGER (DRAWER) DENGAN LABEL BAHASA INGGRIS
         drawer: Drawer(
@@ -2627,6 +2859,19 @@ Future<void> _pickPdfFile() async {
                           final sigsOnPage = _placedSignatures.where((s) => s.pageNumber == page.pageNumber).toList();
                           List<Widget> overlays = [];
 
+                          if (_selectedSigId != null && _activeSignatureBytes == null) {
+                            overlays.add(
+                              Positioned.fill(
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.translucent,
+                                  onTap: () {
+                                    setState(() => _selectedSigId = null);
+                                  },
+                                ),
+                              ),
+                            );
+                          }
+
                           if (_activeSignatureBytes != null) {
                             overlays.add(
                               Positioned.fill(
@@ -2656,6 +2901,7 @@ Future<void> _pickPdfFile() async {
                                         rotation: 0.0,
                                       );
 
+                                      _recordHistoryState();
                                       setState(() {
                                         _placedSignatures.add(newSig);
                                         _selectedSigId = newSig.id;
@@ -2699,6 +2945,11 @@ Future<void> _pickPdfFile() async {
                                   alignment: Alignment.center,
                                   child: GestureDetector(
                                     onTap: () => setState(() => _selectedSigId = sig.id),
+                                    onPanStart: (_) {
+                                      _recordHistoryState();
+                                      _isDraggingOrResizingSig = true;
+                                    },
+                                    onPanEnd: (_) => _isDraggingOrResizingSig = false,
                                     onPanUpdate: (details) {
                                       setState(() {
                                         _selectedSigId = sig.id;
@@ -2728,6 +2979,7 @@ Future<void> _pickPdfFile() async {
                                                 cursor: SystemMouseCursors.alias,
                                                 child: GestureDetector(
                                                   behavior: HitTestBehavior.opaque,
+                                                  onPanStart: (_) => _recordHistoryState(),
                                                   onPanUpdate: (details) {
                                                     setState(() {
                                                       sig.rotation += details.delta.dx * 0.03;
@@ -2755,10 +3007,13 @@ Future<void> _pickPdfFile() async {
                                             top: -10,
                                             right: -10,
                                             child: GestureDetector(
-                                              onTap: () => setState(() {
-                                                _placedSignatures.remove(sig);
-                                                _hasUnsavedChanges = true;
-                                              }),
+                                              onTap: () {
+                                                _recordHistoryState();
+                                                setState(() {
+                                                  _placedSignatures.remove(sig);
+                                                  _hasUnsavedChanges = true;
+                                                });
+                                              },
                                               child: const CircleAvatar(
                                                 radius: 10,
                                                 backgroundColor: Colors.redAccent,
@@ -2774,6 +3029,7 @@ Future<void> _pickPdfFile() async {
                                                 cursor: SystemMouseCursors.resizeLeftRight,
                                                 child: GestureDetector(
                                                   behavior: HitTestBehavior.opaque,
+                                                  onPanStart: (_) => _recordHistoryState(),
                                                   onPanUpdate: (details) {
                                                     setState(() {
                                                       final deltaW = details.delta.dx / pageRect.width;
@@ -2805,6 +3061,7 @@ Future<void> _pickPdfFile() async {
                                                 cursor: SystemMouseCursors.resizeUpDown,
                                                 child: GestureDetector(
                                                   behavior: HitTestBehavior.opaque,
+                                                  onPanStart: (_) => _recordHistoryState(),
                                                   onPanUpdate: (details) {
                                                     setState(() {
                                                       final deltaH = details.delta.dy / pageRect.height;
@@ -2836,6 +3093,7 @@ Future<void> _pickPdfFile() async {
                                                 cursor: SystemMouseCursors.resizeUpLeftDownRight,
                                                 child: GestureDetector(
                                                   behavior: HitTestBehavior.opaque,
+                                                  onPanStart: (_) => _recordHistoryState(),
                                                   onPanUpdate: (details) {
                                                     setState(() {
                                                       final deltaW = details.delta.dx / pageRect.width;
@@ -2881,96 +3139,186 @@ Future<void> _pickPdfFile() async {
         ),
         bottomNavigationBar: _filePath == null || _totalPages == 0
             ? null
-            : Container(
-                height: 56,
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surfaceContainer,
-                  border: Border(
-                    top: BorderSide(color: Theme.of(context).colorScheme.outlineVariant, width: 0.8),
-                  ),
-                ),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    IconButton(
-                      tooltip: 'First Page',
-                      icon: const Icon(Icons.first_page),
-                      onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
-                    ),
-                    IconButton(
-                      tooltip: 'Previous Page',
-                      icon: const Icon(Icons.chevron_left),
-                      onPressed: _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
-                    ),
-                    const SizedBox(width: 6),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(8),
-                      onTap: _showJumpPageDialog,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.surface,
-                          borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
-                        ),
-                        child: Text('Page $_currentPage / $_totalPages', style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    IconButton(
-                      tooltip: 'Next Page',
-                      icon: const Icon(Icons.chevron_right),
-                      onPressed: _currentPage < _totalPages ? () => _goToPage(_currentPage + 1) : null,
-                    ),
-                    IconButton(
-                      tooltip: 'Last Page',
-                      icon: const Icon(Icons.last_page),
-                      onPressed: _currentPage < _totalPages ? () => _goToPage(_totalPages) : null,
-                    ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
-                      child: VerticalDivider(width: 1, color: Theme.of(context).colorScheme.outlineVariant),
-                    ),
-                    IconButton(
-                      tooltip: 'Zoom Out (-)',
-                      icon: const Icon(Icons.zoom_out),
-                      onPressed: _zoomOut,
-                    ),
-                    SizedBox(
-                      width: 130,
-                      child: SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          trackHeight: 3,
-                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                          overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
-                        ),
-                        child: Slider(
-                          value: _currentZoom.clamp(0.5, 4.0),
-                          min: 0.5,
-                          max: 4.0,
-                          onChanged: (val) => _setZoomValue(val),
+            : Builder(
+                builder: (context) {
+                  final bool isCompact = MediaQuery.sizeOf(context).width < 650;
+                  return SafeArea(
+                    top: false,
+                    child: Container(
+                      height: 54,
+                      padding: EdgeInsets.symmetric(horizontal: isCompact ? 4 : 12),
+                      decoration: BoxDecoration(
+                        color: Theme.of(context).colorScheme.surfaceContainer,
+                        border: Border(
+                          top: BorderSide(color: Theme.of(context).colorScheme.outlineVariant, width: 0.8),
                         ),
                       ),
-                    ),
-                    InkWell(
-                      borderRadius: BorderRadius.circular(6),
-                      onTap: _resetZoom,
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                        child: Text(
-                          '${(_currentZoom * 100).toInt()}%',
-                          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-                        ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          if (!isCompact)
+                            IconButton(
+                              tooltip: 'First Page',
+                              icon: const Icon(Icons.first_page),
+                              onPressed: _currentPage > 1 ? () => _goToPage(1) : null,
+                            ),
+                          IconButton(
+                            tooltip: 'Previous Page',
+                            visualDensity: isCompact ? VisualDensity.compact : VisualDensity.standard,
+                            icon: const Icon(Icons.chevron_left),
+                            onPressed: _currentPage > 1 ? () => _goToPage(_currentPage - 1) : null,
+                          ),
+                          SizedBox(width: isCompact ? 2 : 6),
+                          InkWell(
+                            borderRadius: BorderRadius.circular(8),
+                            onTap: _showJumpPageDialog,
+                            child: Container(
+                              padding: EdgeInsets.symmetric(horizontal: isCompact ? 10 : 12, vertical: 6),
+                              decoration: BoxDecoration(
+                                color: Theme.of(context).colorScheme.surface,
+                                borderRadius: BorderRadius.circular(8),
+                                border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+                              ),
+                              child: Text(
+                                isCompact ? '$_currentPage / $_totalPages' : 'Page $_currentPage / $_totalPages',
+                                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13),
+                              ),
+                            ),
+                          ),
+                          SizedBox(width: isCompact ? 2 : 6),
+                          IconButton(
+                            tooltip: 'Next Page',
+                            visualDensity: isCompact ? VisualDensity.compact : VisualDensity.standard,
+                            icon: const Icon(Icons.chevron_right),
+                            onPressed: _currentPage < _totalPages ? () => _goToPage(_currentPage + 1) : null,
+                          ),
+                          if (!isCompact)
+                            IconButton(
+                              tooltip: 'Last Page',
+                              icon: const Icon(Icons.last_page),
+                              onPressed: _currentPage < _totalPages ? () => _goToPage(_totalPages) : null,
+                            ),
+                          Padding(
+                            padding: EdgeInsets.symmetric(horizontal: isCompact ? 6 : 8, vertical: 12),
+                            child: VerticalDivider(width: 1, color: Theme.of(context).colorScheme.outlineVariant),
+                          ),
+                          IconButton(
+                            tooltip: 'Zoom Out (-)',
+                            visualDensity: isCompact ? VisualDensity.compact : VisualDensity.standard,
+                            icon: const Icon(Icons.zoom_out),
+                            onPressed: _zoomOut,
+                          ),
+                          if (!isCompact)
+                            SizedBox(
+                              width: 130,
+                              child: SliderTheme(
+                                data: SliderTheme.of(context).copyWith(
+                                  trackHeight: 3,
+                                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                                ),
+                                child: Slider(
+                                  value: _currentZoom.clamp(0.5, 4.0),
+                                  min: 0.5,
+                                  max: 4.0,
+                                  onChanged: (val) => _setZoomValue(val),
+                                ),
+                              ),
+                            ),
+                          InkWell(
+                            borderRadius: BorderRadius.circular(6),
+                            onTap: _resetZoom,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                              child: Text(
+                                '${(_currentZoom * 100).toInt()}%',
+                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                          ),
+                          IconButton(
+                            tooltip: 'Zoom In (+)',
+                            visualDensity: isCompact ? VisualDensity.compact : VisualDensity.standard,
+                            icon: const Icon(Icons.zoom_in),
+                            onPressed: _zoomIn,
+                          ),
+                        ],
                       ),
                     ),
-                    IconButton(
-                      tooltip: 'Zoom In (+)',
-                      icon: const Icon(Icons.zoom_in),
-                      onPressed: _zoomIn,
-                    ),
-                  ],
-                ),
+                  );
+                },
               ),
+      ),
+    );
+  }
+
+  Widget _buildToolbarButton({
+    required IconData icon,
+    required String label,
+    required VoidCallback? onPressed,
+    Color? iconColor,
+    bool isHighlighted = false,
+  }) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final bool isCompact = MediaQuery.sizeOf(context).width < 650;
+    final bool isDisabled = onPressed == null;
+
+    if (isCompact) {
+      return Tooltip(
+        message: label,
+        child: InkWell(
+          onTap: onPressed,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: (!isDisabled && isHighlighted)
+                  ? colorScheme.primaryContainer.withValues(alpha: 0.65)
+                  : null,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(
+              icon,
+              size: 18,
+              color: isDisabled
+                  ? colorScheme.onSurface.withValues(alpha: 0.35)
+                  : (iconColor ?? (isHighlighted ? colorScheme.onPrimaryContainer : colorScheme.onSurface)),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return TextButton.icon(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        minimumSize: const Size(0, 34),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        backgroundColor: (!isDisabled && isHighlighted)
+            ? colorScheme.primaryContainer.withValues(alpha: 0.65)
+            : null,
+        foregroundColor: isHighlighted ? colorScheme.onPrimaryContainer : colorScheme.onSurface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      ),
+      icon: Icon(icon, size: 17, color: isDisabled ? null : iconColor),
+      label: Text(
+        label,
+        style: TextStyle(
+          fontSize: 12.5,
+          fontWeight: isHighlighted ? FontWeight.w600 : FontWeight.w500,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildToolbarDivider() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+      child: VerticalDivider(
+        width: 1,
+        thickness: 1,
+        color: Theme.of(context).colorScheme.outlineVariant,
       ),
     );
   }
